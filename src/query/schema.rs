@@ -8,7 +8,7 @@
 //   Type error caught
 //   Defaults applied correctly
 //
-// Each collection in UlmenDB can have an optional schema.
+// Each collection in uldb can have an optional schema.
 // Records are validated on insert/update. Invalid records are rejected.
 
 use std::collections::HashMap;

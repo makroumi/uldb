@@ -1,11 +1,11 @@
 #!/usr/bin/env zsh
-# UlmenDB build and test script
+# uldb build and test script
 # Usage: ./scripts/build.sh
 
 set -euo pipefail
 
 echo "============================================"
-echo "UlmenDB Build Pipeline"
+echo "uldb Build Pipeline"
 echo "============================================"
 
 cd "$(dirname "$0")/.."

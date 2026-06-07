@@ -1,18 +1,27 @@
 [package]
-name = "ulmen-core"
+name = "uldb"
 version = "0.1.0"
 edition = "2021"
-authors = ["UlmenDB Contributors"]
-description = "Storage engine for agentic AI workloads"
-license = "Apache-2.0"
+authors = ["El Mehdi Makroumi"]
+description = "Agentic AI database -- storage engine and server"
+license = "BUSL-1.1"
 
 [lib]
-name = "ulmen_core"
+name = "uldb"
+path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "uldb"
+path = "src/bin/uldb.rs"
+
 [dependencies]
-pyo3 = { version = "0.25", features = ["extension-module"] }
 crc32fast = "1.4"
+pyo3 = { version = "0.25", features = ["extension-module"], optional = true }
+
+[features]
+default = []
+python = ["pyo3"]
 
 [dev-dependencies]
 rand = "0.8"

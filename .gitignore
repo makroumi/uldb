@@ -1,21 +1,12 @@
-# Rust
 target/
 Cargo.lock
-
-# Python
 __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+*.so
 dist/
 build/
 .eggs/
-
-# OS
-.DS_Store
-*.swp
-*.swo
-
-# IDE
-.vscode/
-.idea/
+.pytest_cache/
+.venv/
