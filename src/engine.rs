@@ -39,6 +39,7 @@
 //   MVCC store inside is thread-safe (has internal RwLock).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -97,9 +98,9 @@ pub struct Engine {
     snapshots: HashMap<String, Hamt>,
     snapshot_counter: u64,
     flush_count: u64,
-    total_puts: u64,
-    total_gets: u64,
-    total_deletes: u64,
+    total_puts: AtomicU64,
+    total_gets: AtomicU64,
+    total_deletes: AtomicU64,
 }
 
 impl Engine {
@@ -212,9 +213,9 @@ impl Engine {
             snapshots: HashMap::new(),
             snapshot_counter: 0,
             flush_count: 0,
-            total_puts: 0,
-            total_gets: 0,
-            total_deletes: 0,
+            total_puts: AtomicU64::new(0),
+            total_gets: AtomicU64::new(0),
+            total_deletes: AtomicU64::new(0),
         })
     }
 
@@ -230,7 +231,7 @@ impl Engine {
 
         // Memtable second (fast reads).
         let should_flush = self.memtable.put(key.to_vec(), value.to_vec());
-        self.total_puts += 1;
+        self.total_puts.fetch_add(1, Ordering::Relaxed);
 
         // Index for queries.
         self.indices.on_put(key, value);
@@ -251,8 +252,8 @@ impl Engine {
     /// compaction levels (cold data).
     ///
     /// Returns None if the key does not exist or is tombstoned.
-    pub fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
-        self.total_gets += 1;
+    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.total_gets.fetch_add(1, Ordering::Relaxed);
 
         // Check memtable first.
         if self.memtable.contains(key) {
@@ -278,7 +279,7 @@ impl Engine {
         self.wal.flush()?;
 
         let should_flush = self.memtable.delete(key.to_vec());
-        self.total_deletes += 1;
+        self.total_deletes.fetch_add(1, Ordering::Relaxed);
 
         // Update HAMT state.
         self.state = self.state.delete(key);
@@ -294,7 +295,7 @@ impl Engine {
     ///
     /// Merges results from memtable and compaction levels.
     /// Memtable entries take precedence over page entries.
-    pub fn scan(&mut self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pub fn scan(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         // Collect from compaction levels first (oldest data).
         let mut results = {
             let state = self.compactor.state();
@@ -390,9 +391,9 @@ impl Engine {
         c.total_records()
     }
 
-    pub fn total_puts(&self) -> u64 { self.total_puts }
-    pub fn total_gets(&self) -> u64 { self.total_gets }
-    pub fn total_deletes(&self) -> u64 { self.total_deletes }
+    pub fn total_puts(&self) -> u64 { self.total_puts.load(Ordering::Relaxed) }
+    pub fn total_gets(&self) -> u64 { self.total_gets.load(Ordering::Relaxed) }
+    pub fn total_deletes(&self) -> u64 { self.total_deletes.load(Ordering::Relaxed) }
 
     /// Data directory path.
     pub fn data_dir(&self) -> &Path {
@@ -675,7 +676,7 @@ mod tests {
         // Phase 2: reopen and verify all records recovered.
         {
             let config = EngineConfig::new(&dir);
-            let mut engine = Engine::open(config).unwrap();
+            let engine = Engine::open(config).unwrap();
             for i in 0..100u32 {
                 let key = format!("key_{i:04}");
                 let val = format!("val_{i}");
@@ -704,7 +705,7 @@ mod tests {
 
         {
             let config = EngineConfig::new(&dir);
-            let mut engine = Engine::open(config).unwrap();
+            let engine = Engine::open(config).unwrap();
             assert_eq!(engine.get(b"alive"), Some(b"yes".to_vec()));
             assert_eq!(engine.get(b"dead"), None);
         }

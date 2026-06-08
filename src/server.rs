@@ -16,7 +16,7 @@
 //   This is correct for a single-writer database.
 //   Read concurrency can be improved later with RwLock.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use crate::namespace::{scope_key, unscope_key, derive_namespace_id};
 use crate::tx::session::{TxManager, TxIsolation, TxOp};
 
@@ -150,14 +150,14 @@ fn resolve_ns(namespace: &str) -> u64 {
 /// Tracks active transactions per session.
 /// Transaction isolation is enforced by MVCC inside the engine.
 pub struct UmpHandler {
-    engine: Mutex<Engine>,
+    engine: RwLock<Engine>,
     tx_mgr: Mutex<TxManager>,
 }
 
 impl UmpHandler {
     pub fn new(engine: Engine) -> Self {
         Self {
-            engine: Mutex::new(engine),
+            engine: RwLock::new(engine),
             tx_mgr: Mutex::new(TxManager::new()),
         }
     }
@@ -165,7 +165,7 @@ impl UmpHandler {
     /// Begin a transaction. Snapshots the current HAMT state.
     /// Returns the tx_id.
     pub fn begin_tx(&self, isolation: u8) -> u64 {
-        let eng = self.engine.lock().unwrap();
+        let eng = self.engine.read().unwrap();
         let snapshot = eng.state.snapshot();
         let iso = TxIsolation::from_byte(isolation);
         let mut mgr = self.tx_mgr.lock().unwrap();
@@ -185,7 +185,7 @@ impl UmpHandler {
         // Serializable conflict detection: check if any read key
         // was modified since the transaction began.
         if session.isolation == TxIsolation::Serializable {
-            let eng = self.engine.lock().unwrap();
+            let eng = self.engine.read().unwrap();
             for key in &session.read_set {
                 // If the live state has a different value than the snapshot,
                 // another writer modified it.
@@ -202,7 +202,7 @@ impl UmpHandler {
 
         // Apply the write buffer to the engine.
         let count = session.write_buffer.len();
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         for op in session.write_buffer {
             match op {
                 TxOp::Put(key, value) => {
@@ -240,7 +240,7 @@ impl UmpHandler {
         drop(mgr);
 
         // Fallback: no active tx, read live.
-        let mut eng = self.engine.lock().unwrap();
+        let eng = self.engine.write().unwrap();
         eng.get(&scoped)
     }
 
@@ -317,7 +317,7 @@ impl Handler for UmpHandler {
     fn handle_put(&self, msg: record::Put) -> Response {
         let ns_id = 0u64; // namespace scoping applied at workspace level
         let scoped = scope_key(ns_id, msg.key.as_bytes());
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         match eng.put(&scoped, &msg.value) {
             Ok(()) => result_end_response(1, 0),
             Err(e) => error_response(0xFF, &format!("put failed: {e}")),
@@ -327,7 +327,7 @@ impl Handler for UmpHandler {
     fn handle_get(&self, msg: record::Get) -> Response {
         let ns_id = 0u64;
         let scoped = scope_key(ns_id, msg.key.as_bytes());
-        let mut eng = self.engine.lock().unwrap();
+        let eng = self.engine.write().unwrap();
         match eng.get(&scoped) {
             Some(value) => {
                 let payload = enc(vec![
@@ -352,7 +352,7 @@ impl Handler for UmpHandler {
     fn handle_delete(&self, msg: record::Delete) -> Response {
         let ns_id = 0u64;
         let scoped = scope_key(ns_id, msg.key.as_bytes());
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         match eng.delete(&scoped) {
             Ok(()) => result_end_response(1, 0),
             Err(e) => error_response(0xFF, &format!("delete failed: {e}")),
@@ -363,7 +363,7 @@ impl Handler for UmpHandler {
         let ns_id = 0u64;
         let scoped_start = scope_key(ns_id, msg.start.as_bytes());
         let scoped_end = scope_key(ns_id, msg.end.as_bytes());
-        let mut eng = self.engine.lock().unwrap();
+        let eng = self.engine.write().unwrap();
         let results = eng.scan(&scoped_start, &scoped_end);
         let truncated: Vec<_> = results.into_iter().take(msg.limit as usize).collect();
 
@@ -405,7 +405,7 @@ impl Handler for UmpHandler {
 
     fn handle_put_batch(&self, msg: record::PutBatch) -> Response {
         let ns_id = 0u64;
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         let count = msg.records.len();
 
         for (key, value) in msg.records {
@@ -422,7 +422,7 @@ impl Handler for UmpHandler {
         let ns_id = 0u64;
         let scoped_start = scope_key(ns_id, msg.start.as_bytes());
         let scoped_end = scope_key(ns_id, msg.end.as_bytes());
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         let keys: Vec<Vec<u8>> = eng
             .scan(&scoped_start, &scoped_end)
             .into_iter()
@@ -440,7 +440,7 @@ impl Handler for UmpHandler {
     }
 
     fn handle_query(&self, msg: query::Query) -> Response {
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
 
         let spec = crate::query::planner::QuerySpec {
             text: msg.text,
@@ -531,7 +531,7 @@ impl Handler for UmpHandler {
     fn handle_get_batch(&self, msg: record::GetBatch) -> Response {
         let ns_id = 0u64;
         let mut frames = Vec::new();
-        let mut eng = self.engine.lock().unwrap();
+        let eng = self.engine.write().unwrap();
         let mut found = 0u32;
 
         frames.push((
@@ -569,7 +569,7 @@ impl Handler for UmpHandler {
     }
 
     fn handle_query_fuzzy(&self, msg: query::QueryFuzzy) -> Response {
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         let spec = crate::query::planner::QuerySpec {
             text: msg.query,
             top_k: msg.top_k as usize,
@@ -580,7 +580,7 @@ impl Handler for UmpHandler {
     }
 
     fn handle_query_vector(&self, msg: query::QueryVector) -> Response {
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         let spec = crate::query::planner::QuerySpec {
             vector: msg.vector,
             top_k: msg.top_k as usize,
@@ -591,7 +591,7 @@ impl Handler for UmpHandler {
     }
 
     fn handle_query_graph(&self, msg: query::QueryGraph) -> Response {
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         let spec = crate::query::planner::QuerySpec {
             text: msg.start_key,
             relations: msg.relations,
@@ -622,7 +622,7 @@ impl Handler for UmpHandler {
     }
 
     fn handle_stats(&self, _msg: admin::Stats) -> Response {
-        let eng = self.engine.lock().unwrap();
+        let eng = self.engine.read().unwrap();
         let payload = enc(vec![
             string_field("memtable_len"),
             u32_field(eng.memtable_len() as u32),
@@ -647,7 +647,7 @@ impl Handler for UmpHandler {
     }
 
     fn handle_compact(&self, _msg: admin::Compact) -> Response {
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         match eng.flush() {
             Ok(()) => result_end_response(0, 0),
             Err(e) => error_response(0xFF, &format!("compact failed: {e}")),
@@ -700,7 +700,7 @@ impl Handler for UmpHandler {
     // ========================================================================
 
     fn handle_snap_create(&self, msg: snapshot::SnapCreate) -> Response {
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         let id = eng.snapshot_create(&msg.description);
         let payload = enc(vec![string_field(&id)]);
         Response::Single {
@@ -710,7 +710,7 @@ impl Handler for UmpHandler {
     }
 
     fn handle_snap_restore(&self, msg: snapshot::SnapRestore) -> Response {
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         match eng.snapshot_restore(&msg.snapshot_id) {
             Ok(()) => result_end_response(1, 0),
             Err(e) => error_response(0x82, &e),
@@ -718,7 +718,7 @@ impl Handler for UmpHandler {
     }
 
     fn handle_snap_delete(&self, msg: snapshot::SnapDelete) -> Response {
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         if eng.snapshot_delete(&msg.snapshot_id) {
             result_end_response(1, 0)
         } else {
@@ -727,7 +727,7 @@ impl Handler for UmpHandler {
     }
 
     fn handle_snap_list(&self, _msg: snapshot::SnapList) -> Response {
-        let eng = self.engine.lock().unwrap();
+        let eng = self.engine.read().unwrap();
         let names = eng.snapshot_list();
         let mut frames = Vec::new();
         frames.push((
@@ -752,7 +752,7 @@ impl Handler for UmpHandler {
     // ========================================================================
 
     fn handle_branch_create(&self, msg: branch::BranchCreate) -> Response {
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         match eng.branch_create(&msg.branch_id, &msg.from_snapshot) {
             Ok(id) => {
                 let payload = enc(vec![string_field(&id)]);
@@ -766,7 +766,7 @@ impl Handler for UmpHandler {
     }
 
     fn handle_branch_merge(&self, msg: branch::BranchMerge) -> Response {
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         match eng.branch_merge(&msg.branch_id) {
             Ok(count) => result_end_response(count as u32, 0),
             Err(e) => error_response(0x81, &e),
@@ -774,7 +774,7 @@ impl Handler for UmpHandler {
     }
 
     fn handle_branch_rollback(&self, msg: branch::BranchRollback) -> Response {
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         if eng.branch_rollback(&msg.branch_id) {
             result_end_response(1, 0)
         } else {
@@ -783,7 +783,7 @@ impl Handler for UmpHandler {
     }
 
     fn handle_branch_diff(&self, msg: branch::BranchDiff) -> Response {
-        let eng = self.engine.lock().unwrap();
+        let eng = self.engine.read().unwrap();
         match eng.branch_diff(&msg.branch_a) {
             Ok(diffs) => {
                 let mut frames = Vec::new();
@@ -816,7 +816,7 @@ impl Handler for UmpHandler {
     fn handle_branch_list(&self, _msg: branch::BranchList) -> Response {
         // Branches are stored in the same map as snapshots.
         // For now, list all snapshots as potential branches.
-        let eng = self.engine.lock().unwrap();
+        let eng = self.engine.read().unwrap();
         let names = eng.snapshot_list();
         let mut frames = Vec::new();
         frames.push((
@@ -842,7 +842,7 @@ impl Handler for UmpHandler {
 
     fn handle_ns_create(&self, msg: namespace::NsCreate) -> Response {
         // Store namespace metadata as a record.
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         let ns_key = format!("__ns__::{}", msg.repo_url);
         let ns_val = format!("{}|{}", msg.commit_sha, msg.description);
         match eng.put(ns_key.as_bytes(), ns_val.as_bytes()) {
@@ -852,7 +852,7 @@ impl Handler for UmpHandler {
     }
 
     fn handle_ns_list(&self, _msg: namespace::NsList) -> Response {
-        let mut eng = self.engine.lock().unwrap();
+        let eng = self.engine.write().unwrap();
         let results = eng.scan(b"__ns__::", b"__ns__::\xff");
         let mut frames = Vec::new();
         frames.push((
@@ -878,7 +878,7 @@ impl Handler for UmpHandler {
     }
 
     fn handle_ns_stat(&self, _msg: namespace::NsStat) -> Response {
-        let eng = self.engine.lock().unwrap();
+        let eng = self.engine.read().unwrap();
         let idx_stats = eng.indices.stats();
         let payload = enc(vec![
             string_field("memtable_len"),
@@ -917,7 +917,7 @@ impl Handler for UmpHandler {
 
     fn handle_ns_delete(&self, msg: namespace::NsDelete) -> Response {
         // Delete all keys in the namespace via range delete.
-        let mut eng = self.engine.lock().unwrap();
+        let mut eng = self.engine.write().unwrap();
         let (start, end) = crate::namespace::ns_scan_range(msg.namespace_id);
         let keys: Vec<Vec<u8>> = eng.scan(&start, &end)
             .into_iter()

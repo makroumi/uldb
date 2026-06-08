@@ -142,7 +142,7 @@ fn confirm_wal_crash_recovery_e2e() {
     }
 
     {
-        let mut eng = open_engine(&dir);
+        let eng = open_engine(&dir);
         for i in 0..500u32 {
             let key = format!("crash_key_{i:05}");
             let expected = format!("crash_val_{i}");
@@ -474,7 +474,7 @@ fn gap_p0_1_page_persistence_after_restart() {
     }
 
     {
-        let mut eng = open_engine_small(&dir);
+        let eng = open_engine_small(&dir);
 
         let mut lost = 0u32;
         for i in 0..50u32 {
