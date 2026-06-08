@@ -444,15 +444,25 @@ impl Engine {
     /// Merges results from memtable and compaction levels.
     /// Memtable entries take precedence over page entries.
     pub fn scan(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        // Collect from compaction levels first (oldest data).
+        // Fast path: if no frozen memtables and no compacted data,
+        // all data is in the active memtable. Skip compaction lock.
+        if self.frozen.is_empty() && self.flush_count == 0 {
+            let mut results = Vec::new();
+            for (key, entry) in self.memtable.range(start, end) {
+                if let Some(value) = &entry.value {
+                    results.push((key.to_vec(), value.clone()));
+                }
+            }
+            return results;
+        }
+
+        // Full path: merge compaction + frozen + active.
         let mut results = {
             let state = self.compactor.state();
             let c = state.lock().unwrap();
             c.scan(start, end)
         };
 
-        // Frozen memtables are newer than compacted pages.
-        // Apply oldest frozen first, then newest.
         for frozen in &self.frozen {
             for (key, entry) in frozen.range(start, end) {
                 if let Some(value) = &entry.value {
@@ -463,7 +473,6 @@ impl Engine {
             }
         }
 
-        // Active memtable is newest, takes final precedence.
         for (key, entry) in self.memtable.range(start, end) {
             if let Some(value) = &entry.value {
                 results.insert(key.to_vec(), value.clone());
@@ -483,8 +492,6 @@ impl Engine {
         if !self.memtable.is_empty() {
             self.flush_memtable()?;
         }
-        // Clear frozen memtables since their data is now in pages.
-        self.frozen.clear();
         Ok(())
     }
 

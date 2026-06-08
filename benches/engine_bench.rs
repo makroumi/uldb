@@ -497,7 +497,107 @@ fn main() {
     println!("\n--- STORAGE ---");
     bench_disk_footprint(10_000);
 
-    println!("\n--- GET BREAKDOWN ---");
+    println!("\n--- DELETE BREAKDOWN ---");
+    {
+        let dir = tmp_dir("del_profile");
+        let config = EngineConfig::new(&dir);
+        let mut engine = Engine::open(config).unwrap();
+
+        // Seed 50K records
+        for i in 0..50_000u64 {
+            engine.put(format!("del_{i:08}").as_bytes(), b"value_padding_xxxx").unwrap();
+        }
+
+        let n = 10_000u64;
+        let keys: Vec<Vec<u8>> = (0..n).map(|i| format!("del_{i:08}").into_bytes()).collect();
+
+        // Time full delete
+        let start = Instant::now();
+        for key in &keys {
+            engine.delete(key).unwrap();
+        }
+        let total = start.elapsed();
+
+        // Compare with delete on an engine with NO indexed data (skip index cost)
+        let dir2 = tmp_dir("del_noindex");
+        let config2 = EngineConfig::new(&dir2);
+        let mut engine2 = Engine::open(config2).unwrap();
+        for i in 0..n {
+            engine2.put(format!("dx_{i:08}").as_bytes(), b"v").unwrap();
+        }
+        let start2 = Instant::now();
+        for i in 0..n {
+            engine2.delete(format!("dx_{i:08}").as_bytes()).unwrap();
+        }
+        let noindex_total = start2.elapsed();
+
+        println!("  DELETE ({n} ops from 50K records):");
+        println!("    Full delete:    {:>6}ns/op ({:.0}K ops/sec)",
+            total.as_nanos() / n as u128,
+            n as f64 / total.as_secs_f64() / 1000.0);
+        println!("    Small dataset:  {:>6}ns/op ({:.0}K ops/sec)",
+            noindex_total.as_nanos() / n as u128,
+            n as f64 / noindex_total.as_secs_f64() / 1000.0);
+        println!("    Index overhead: {:>6}ns/op",
+            (total.as_nanos().saturating_sub(noindex_total.as_nanos())) / n as u128);
+
+        drop(engine);
+        drop(engine2);
+        cleanup(&dir);
+        cleanup(&dir2);
+    }
+
+    println!("\n--- SCAN BREAKDOWN ---");
+    {
+        let dir = tmp_dir("scan_profile");
+        let config = EngineConfig::new(&dir);
+        let mut engine = Engine::open(config).unwrap();
+
+        for i in 0..10_000u64 {
+            engine.put(format!("sc_{i:08}").as_bytes(), b"scan_value_padding_xxxx").unwrap();
+        }
+
+        let n = 1000u64;
+
+        // Scan 100 keys (memtable-only since 32MB threshold)
+        let start = Instant::now();
+        for _ in 0..n {
+            let _ = engine.scan(b"sc_00002500", b"sc_00002600");
+        }
+        let scan_time = start.elapsed();
+
+        // Scan 10 keys (smaller range)
+        let start2 = Instant::now();
+        for _ in 0..n {
+            let _ = engine.scan(b"sc_00005000", b"sc_00005010");
+        }
+        let scan10 = start2.elapsed();
+
+        // Single key get for comparison
+        let start3 = Instant::now();
+        for _ in 0..n {
+            let _ = engine.get(b"sc_00005000");
+        }
+        let get_time = start3.elapsed();
+
+        println!("  SCAN from 10K records ({n} iters):");
+        println!("    Scan 100 keys: {:>6}ns/op ({:.0}K scans/sec)",
+            scan_time.as_nanos() / n as u128,
+            n as f64 / scan_time.as_secs_f64() / 1000.0);
+        println!("    Scan 10 keys:  {:>6}ns/op ({:.0}K scans/sec)",
+            scan10.as_nanos() / n as u128,
+            n as f64 / scan10.as_secs_f64() / 1000.0);
+        println!("    Single GET:    {:>6}ns/op ({:.0}K ops/sec)",
+            get_time.as_nanos() / n as u128,
+            n as f64 / get_time.as_secs_f64() / 1000.0);
+        println!("    Scan overhead per key: {:>3}ns",
+            (scan10.as_nanos() / n as u128).saturating_sub(get_time.as_nanos() / n as u128) / 10);
+
+        drop(engine);
+        cleanup(&dir);
+    }
+
+        println!("\n--- GET BREAKDOWN ---");
     {
         let dir = tmp_dir("get_profile");
         let config = EngineConfig::new(&dir);

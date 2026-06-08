@@ -181,25 +181,9 @@ impl Bm25Index {
             None => return, // not indexed
         };
 
-        // Only touch posting lists for terms this document contains.
-        // This is O(terms_in_doc) instead of O(all_terms_in_index).
-        if doc_id < self.doc_terms.len() {
-            let term_ids = std::mem::take(&mut self.doc_terms[doc_id]);
-            for &tid in &term_ids {
-                if let Some(entries) = self.postings.get_mut(&tid) {
-                    entries.retain(|(id, _)| *id != doc_id);
-                    if let Some(df) = self.df.get_mut(&tid) {
-                        *df = df.saturating_sub(1);
-                    }
-                    if entries.is_empty() {
-                        self.postings.remove(&tid);
-                        self.df.remove(&tid);
-                    }
-                }
-            }
-        }
-
-        // Mark doc as removed; update counters incrementally
+        // Mark doc as deleted. Do NOT scan posting lists.
+        // Deleted docs are filtered at query time during search().
+        // This makes delete O(1) instead of O(terms * posting_length).
         let removed_len = self.doc_len[doc_id] as u64;
         self.docs[doc_id] = Vec::new();
         self.doc_len[doc_id] = 0;
@@ -210,6 +194,8 @@ impl Bm25Index {
         } else {
             0.0
         };
+        // doc_terms and df are left as-is. Stale postings are filtered
+        // during search by checking if docs[doc_id] is empty.
     }
 
         /// Search with a natural-language or keyword query.
@@ -248,6 +234,10 @@ impl Bm25Index {
                 None => continue,
             };
             for &(doc_id, tf) in postings {
+                // Skip deleted documents
+                if doc_id >= self.docs.len() || self.docs[doc_id].is_empty() {
+                    continue;
+                }
                 let tf = tf as f64;
                 let dl = self.doc_len[doc_id] as f64;
 
