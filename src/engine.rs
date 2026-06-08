@@ -87,7 +87,7 @@ pub struct Engine {
     memtable: Memtable,
     compaction: CompactionManager,
     pub indices: IndexManager,
-    state: Hamt,
+    pub state: Hamt,
     snapshots: HashMap<String, Hamt>,
     snapshot_counter: u64,
     flush_count: u64,
@@ -110,6 +110,7 @@ impl Engine {
         // Replay existing WAL if present.
         let mut memtable = Memtable::new(config.flush_threshold);
         let mut compaction = CompactionManager::new();
+        let mut indices = IndexManager::new();
 
         if wal_path.exists() {
             let reader = WalReader::open(&wal_path)?;
@@ -131,6 +132,8 @@ impl Engine {
                     // Empty value = tombstone (delete marker).
                     memtable.delete(key);
                 } else {
+                    // Feed into indices for query support.
+                    indices.on_put(&key, &value);
                     memtable.put(key, value);
                 }
             }
@@ -139,6 +142,14 @@ impl Engine {
             if memtable.should_flush() {
                 let page = Self::memtable_to_page(&mut memtable);
                 compaction.add_l0_page(page);
+            }
+        }
+
+        // Rebuild HAMT state from memtable (populated by WAL replay or empty).
+        let mut initial_state = Hamt::new();
+        for (key, entry) in memtable.iter() {
+            if let Some(value) = &entry.value {
+                initial_state = initial_state.put(key.to_vec(), value.clone());
             }
         }
 
@@ -151,8 +162,8 @@ impl Engine {
             wal,
             memtable,
             compaction,
-            indices: IndexManager::new(),
-            state: Hamt::new(),
+            indices,
+            state: initial_state,
             snapshots: HashMap::new(),
             snapshot_counter: 0,
             flush_count: 0,
@@ -897,6 +908,116 @@ mod tests {
         }
 
         drop(engine);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn indices_survive_restart() {
+        let dir = tmp_dir("idx_persist");
+
+        // Phase 1: write records and close.
+        {
+            let config = EngineConfig::new(&dir);
+            let mut engine = Engine::open(config).unwrap();
+
+            engine.put(b"auth.py::validate_token", b"def validate_token validates JWT").unwrap();
+            engine.put(b"auth.py::hash_password", b"def hash_password uses bcrypt").unwrap();
+            engine.put(b"models.py::User", b"class User with email field").unwrap();
+            engine.put(b"utils.py::sendEmail", b"def sendEmail sends via SMTP").unwrap();
+
+            // Verify indices work before close.
+            let spec = crate::query::planner::QuerySpec {
+                text: "validate".into(),
+                top_k: 5,
+                ..Default::default()
+            };
+            let results = engine.indices.query(&spec);
+            assert!(!results.is_empty(), "query should find results before close");
+
+            engine.close().unwrap();
+        }
+
+        // Phase 2: reopen and verify indices are rebuilt from WAL.
+        {
+            let config = EngineConfig::new(&dir);
+            let mut engine = Engine::open(config).unwrap();
+
+            // BM25 should find "validate"
+            let spec = crate::query::planner::QuerySpec {
+                text: "validate".into(),
+                top_k: 5,
+                ..Default::default()
+            };
+            let results = engine.indices.query(&spec);
+            assert!(
+                !results.is_empty(),
+                "BM25 index should be rebuilt from WAL replay"
+            );
+
+            let keys: Vec<String> = results.iter()
+                .map(|r| String::from_utf8_lossy(&r.key).to_string())
+                .collect();
+            assert!(
+                keys.iter().any(|k| k.contains("validate_token")),
+                "validate_token should be in results after restart"
+            );
+
+            // Fuzzy should find "vallidateToken" (typo)
+            let spec2 = crate::query::planner::QuerySpec {
+                text: "vallidateToken".into(),
+                top_k: 3,
+                ..Default::default()
+            };
+            let results2 = engine.indices.query(&spec2);
+            assert!(
+                !results2.is_empty(),
+                "fuzzy index should be rebuilt from WAL replay"
+            );
+
+            // Storage should also have the data
+            assert_eq!(
+                engine.get(b"auth.py::validate_token"),
+                Some(b"def validate_token validates JWT".to_vec()),
+            );
+            assert_eq!(
+                engine.get(b"models.py::User"),
+                Some(b"class User with email field".to_vec()),
+            );
+        }
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn hamt_state_survives_restart() {
+        let dir = tmp_dir("hamt_persist");
+
+        {
+            let config = EngineConfig::new(&dir);
+            let mut engine = Engine::open(config).unwrap();
+
+            engine.put(b"k1", b"v1").unwrap();
+            engine.put(b"k2", b"v2").unwrap();
+            engine.put(b"k3", b"v3").unwrap();
+
+            // HAMT state should match
+            assert_eq!(engine.state.get(b"k1"), Some(b"v1".as_ref()));
+            assert_eq!(engine.state.len(), 3);
+
+            engine.close().unwrap();
+        }
+
+        {
+            let config = EngineConfig::new(&dir);
+            let engine = Engine::open(config).unwrap();
+
+            // HAMT rebuilt from WAL
+            assert_eq!(engine.state.get(b"k1"), Some(b"v1".as_ref()));
+            assert_eq!(engine.state.get(b"k2"), Some(b"v2".as_ref()));
+            assert_eq!(engine.state.get(b"k3"), Some(b"v3".as_ref()));
+            assert_eq!(engine.state.len(), 3);
+        }
+
         cleanup(&dir);
     }
 
