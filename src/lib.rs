@@ -7,13 +7,17 @@
 //   index/    bloom filter, fuzzy symbol matcher
 //   tx/       MVCC transactions
 //   query/    schema validation
-//   engine    unified storage engine (WAL + memtable + pages + compaction)
+//   engine    unified storage engine
+//   server    UMP protocol handler (requires ulmp)
 
 pub mod storage;
 pub mod index;
 pub mod tx;
 pub mod query;
 pub mod engine;
+
+#[cfg(feature = "server")]
+pub mod server;
 
 #[cfg(feature = "python")]
 mod python;

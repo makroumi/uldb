@@ -17,10 +17,12 @@ path = "src/bin/uldb.rs"
 
 [dependencies]
 crc32fast = "1.4"
+ulmp = { path = "../ulmp", optional = true }
 pyo3 = { version = "0.25", features = ["extension-module"], optional = true }
 
 [features]
-default = []
+default = ["server"]
+server = ["ulmp"]
 python = ["pyo3"]
 
 [dev-dependencies]

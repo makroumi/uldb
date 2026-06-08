@@ -1,9 +1,11 @@
 // src/index/mod.rs
 //
-// Index subsystem: HNSW vectors, CSR graph, fuzzy matching, bloom filter.
+// Index subsystem.
 //
-// Each index is independent and can be queried in parallel.
-// The query planner decides which indices to consult.
+// bloom:  probabilistic membership filter
+// fuzzy:  trigram + Levenshtein symbol search
+// hnsw:   approximate nearest neighbor vector search
 
 pub mod bloom;
 pub mod fuzzy;
+pub mod hnsw;
