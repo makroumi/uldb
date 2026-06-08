@@ -94,49 +94,7 @@ fn is_error_response(resp: &Response) -> bool {
     }
 }
 
-/// Extract the first TAG_BYTES field value from a raw payload.
-/// Used to inspect values returned inside OP_RESULT_ROW payloads.
-fn extract_bytes_field(payload: &[u8]) -> Option<Vec<u8>> {
-    const TAG_STRING: u8 = 0x0D;
-    const TAG_BYTES: u8 = 0x0C;
-    const TAG_END: u8 = 0xFF;
 
-    let mut pos = 0usize;
-    while pos < payload.len() {
-        let tag = payload[pos];
-        pos += 1;
-        match tag {
-            TAG_END => break,
-            TAG_STRING | TAG_BYTES => {
-                if pos + 4 > payload.len() {
-                    break;
-                }
-                let len =
-                    u32::from_be_bytes(payload[pos..pos + 4].try_into().ok()?) as usize;
-                pos += 4;
-                if pos + len > payload.len() {
-                    break;
-                }
-                let data = payload[pos..pos + len].to_vec();
-                pos += len;
-                if tag == TAG_BYTES {
-                    return Some(data);
-                }
-            }
-            0x01 => {
-                pos += 1; // TAG_U8
-            }
-            0x03 => {
-                pos += 4; // TAG_U32
-            }
-            0x04 => {
-                pos += 8; // TAG_U64
-            }
-            _ => break,
-        }
-    }
-    None
-}
 
 /// Deterministic LCG random f64 in [0, 1).
 fn lcg(state: &mut u64) -> f64 {
@@ -641,17 +599,9 @@ fn gap_p0_3_transaction_snapshot_isolation() {
         value: b"500".to_vec(),
     });
 
-    // Within the transaction, read acct:alice.
+    // Within the transaction, read acct:alice via tx_get.
     // With proper snapshot isolation this MUST return 1000 (value at tx_begin).
-    // Currently the handler has no session state, so it reads the live value.
-    let read_resp = handler.handle_get(record::Get {
-        key: "acct:alice".into(),
-    });
-
-    let value_in_tx = match &read_resp {
-        Response::Single { payload, .. } => extract_bytes_field(payload),
-        _ => None,
-    };
+    let value_in_tx = handler.tx_get(tx_id, "acct:alice");
 
     // REQUIRED BEHAVIOUR (FIX): value_in_tx == Some(b"1000")
     // CURRENT BEHAVIOUR (GAP): value_in_tx == Some(b"500")

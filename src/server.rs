@@ -18,7 +18,7 @@
 
 use std::sync::Mutex;
 use crate::namespace::{scope_key, unscope_key, derive_namespace_id};
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::tx::session::{TxManager, TxIsolation, TxOp};
 
 use ulmp::messages::opcode;
 use ulmp::messages::tx;
@@ -140,19 +140,123 @@ fn resolve_ns(namespace: &str) -> u64 {
 /// Transaction isolation is enforced by MVCC inside the engine.
 pub struct UmpHandler {
     engine: Mutex<Engine>,
-    tx_counter: AtomicU64,
+    tx_mgr: Mutex<TxManager>,
 }
 
 impl UmpHandler {
     pub fn new(engine: Engine) -> Self {
         Self {
             engine: Mutex::new(engine),
-            tx_counter: AtomicU64::new(1),
+            tx_mgr: Mutex::new(TxManager::new()),
         }
     }
 
-    fn next_tx_id(&self) -> u64 {
-        self.tx_counter.fetch_add(1, Ordering::Relaxed)
+    /// Begin a transaction. Snapshots the current HAMT state.
+    /// Returns the tx_id.
+    pub fn begin_tx(&self, isolation: u8) -> u64 {
+        let eng = self.engine.lock().unwrap();
+        let snapshot = eng.state.snapshot();
+        let iso = TxIsolation::from_byte(isolation);
+        let mut mgr = self.tx_mgr.lock().unwrap();
+        mgr.begin(iso, snapshot)
+    }
+
+    /// Commit a transaction. Applies all buffered writes to the engine.
+    /// Returns Ok(count) with the number of operations applied,
+    /// or Err(msg) on conflict (serializable isolation).
+    pub fn commit_tx(&self, tx_id: u64) -> Result<usize, String> {
+        let session = {
+            let mut mgr = self.tx_mgr.lock().unwrap();
+            mgr.remove(tx_id)
+                .ok_or_else(|| format!("transaction not found: {tx_id}"))?
+        };
+
+        // Serializable conflict detection: check if any read key
+        // was modified since the transaction began.
+        if session.isolation == TxIsolation::Serializable {
+            let eng = self.engine.lock().unwrap();
+            for key in &session.read_set {
+                // If the live state has a different value than the snapshot,
+                // another writer modified it.
+                let live_val = eng.state.get(key);
+                let snap_val = session.snapshot.get(key);
+                if live_val != snap_val {
+                    return Err(format!(
+                        "serialization conflict on key={}",
+                        String::from_utf8_lossy(key)
+                    ));
+                }
+            }
+        }
+
+        // Apply the write buffer to the engine.
+        let count = session.write_buffer.len();
+        let mut eng = self.engine.lock().unwrap();
+        for op in session.write_buffer {
+            match op {
+                TxOp::Put(key, value) => {
+                    if let Err(e) = eng.put(&key, &value) {
+                        return Err(format!("tx commit put failed: {e}"));
+                    }
+                }
+                TxOp::Delete(key) => {
+                    if let Err(e) = eng.delete(&key) {
+                        return Err(format!("tx commit delete failed: {e}"));
+                    }
+                }
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Rollback a transaction. Discards all buffered writes.
+    pub fn rollback_tx(&self, tx_id: u64) -> bool {
+        let mut mgr = self.tx_mgr.lock().unwrap();
+        mgr.remove(tx_id).is_some()
+    }
+
+    /// Read a key within a transaction (snapshot isolation).
+    /// Falls back to the live engine if tx_id is not found.
+    pub fn tx_get(&self, tx_id: u64, key: &str) -> Option<Vec<u8>> {
+        let ns_id = 0u64;
+        let scoped = scope_key(ns_id, key.as_bytes());
+
+        let mut mgr = self.tx_mgr.lock().unwrap();
+        if let Some(session) = mgr.get_mut(tx_id) {
+            return session.get(&scoped);
+        }
+        drop(mgr);
+
+        // Fallback: no active tx, read live.
+        let mut eng = self.engine.lock().unwrap();
+        eng.get(&scoped)
+    }
+
+    /// Write a key within a transaction (buffered, not applied until commit).
+    pub fn tx_put(&self, tx_id: u64, key: &str, value: Vec<u8>) -> bool {
+        let ns_id = 0u64;
+        let scoped = scope_key(ns_id, key.as_bytes());
+
+        let mut mgr = self.tx_mgr.lock().unwrap();
+        if let Some(session) = mgr.get_mut(tx_id) {
+            session.put(scoped, value);
+            return true;
+        }
+        false
+    }
+
+    /// Delete a key within a transaction (buffered, not applied until commit).
+    pub fn tx_delete(&self, tx_id: u64, key: &str) -> bool {
+        let ns_id = 0u64;
+        let scoped = scope_key(ns_id, key.as_bytes());
+
+        let mut mgr = self.tx_mgr.lock().unwrap();
+        if let Some(session) = mgr.get_mut(tx_id) {
+            session.delete(scoped);
+            return true;
+        }
+        false
     }
 }
 
@@ -399,8 +503,8 @@ impl Handler for UmpHandler {
     // Transaction operations
     // ========================================================================
 
-    fn handle_tx_begin(&self, _msg: tx::TxBegin) -> Response {
-        let tx_id = self.next_tx_id();
+    fn handle_tx_begin(&self, msg: tx::TxBegin) -> Response {
+        let tx_id = self.begin_tx(msg.isolation);
         let payload = enc(vec![u64_field(tx_id)]);
         Response::Single {
             opcode: opcode::OP_RESULT_END,
@@ -408,22 +512,27 @@ impl Handler for UmpHandler {
         }
     }
 
-    fn handle_tx_commit(&self, _msg: tx::TxCommit) -> Response {
-        // In the current engine, writes are immediately durable via WAL.
-        // Transaction commit is acknowledged.
-        result_end_response(1, 0)
+    fn handle_tx_commit(&self, msg: tx::TxCommit) -> Response {
+        match self.commit_tx(msg.tx_id) {
+            Ok(count) => result_end_response(count as u32, 0),
+            Err(e) => error_response(0x61, &e), // ERR_TX_CONFLICT
+        }
     }
 
-    fn handle_tx_rollback(&self, _msg: tx::TxRollback) -> Response {
-        // Transaction rollback acknowledged.
-        // In a full implementation, buffered writes would be discarded.
-        result_end_response(0, 0)
+    fn handle_tx_rollback(&self, msg: tx::TxRollback) -> Response {
+        if self.rollback_tx(msg.tx_id) {
+            result_end_response(0, 0)
+        } else {
+            error_response(0x60, &format!("transaction not found: {}", msg.tx_id))
+        }
     }
 
     fn handle_tx_status(&self, msg: tx::TxStatus) -> Response {
+        let mgr = self.tx_mgr.lock().unwrap();
+        let status = if mgr.exists(msg.tx_id) { "active" } else { "unknown" };
         let payload = enc(vec![
             u64_field(msg.tx_id),
-            string_field("committed"),
+            string_field(status),
         ]);
         Response::Single {
             opcode: opcode::OP_RESULT_END,
@@ -918,7 +1027,17 @@ mod tests {
     #[test]
     fn handler_tx_commit() {
         let (handler, dir) = make_handler("tx_commit");
-        let resp = handler.handle_tx_commit(tx::TxCommit { tx_id: 1 });
+
+        // Must begin a transaction before committing it.
+        let begin_resp = handler.handle_tx_begin(tx::TxBegin { isolation: 0x02 });
+        let tx_id = match &begin_resp {
+            Response::Single { payload, .. } if payload.len() >= 9 => {
+                u64::from_be_bytes(payload[1..9].try_into().unwrap())
+            }
+            _ => panic!("tx_begin should return tx_id"),
+        };
+
+        let resp = handler.handle_tx_commit(tx::TxCommit { tx_id });
         match resp {
             Response::Single { opcode, .. } => {
                 assert_eq!(opcode, opcode::OP_RESULT_END);

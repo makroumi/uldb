@@ -7,3 +7,4 @@
 
 pub mod mvcc;
 pub mod hamt;
+pub mod session;
