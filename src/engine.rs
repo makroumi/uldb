@@ -53,7 +53,7 @@ use crate::index::manager::IndexManager;
 use crate::tx::hamt::Hamt;
 
 /// Default memtable flush threshold: 4MB.
-const DEFAULT_FLUSH_THRESHOLD: usize = 4 * 1024 * 1024;
+const DEFAULT_FLUSH_THRESHOLD: usize = 32 * 1024 * 1024;
 
 /// WAL file name within the data directory.
 const WAL_FILENAME: &str = "wal.log";
@@ -93,6 +93,8 @@ pub struct Engine {
     data_dir: PathBuf,
     wal: WalWriter,
     memtable: Memtable,
+    frozen: Vec<Memtable>,
+    flush_threshold: usize,
     compactor: BackgroundCompactor,
     pub indices: IndexManager,
     pub state: Hamt,
@@ -214,6 +216,8 @@ impl Engine {
             data_dir: config.data_dir,
             wal,
             memtable,
+            frozen: Vec::new(),
+            flush_threshold: config.flush_threshold,
             compactor,
             indices,
             state: initial_state,
@@ -374,19 +378,25 @@ impl Engine {
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.total_gets.fetch_add(1, Ordering::Relaxed);
 
-        // Single memtable lookup: get the entry directly and check
-        // tombstone in one operation. Avoids 3 separate BTreeMap lookups.
+        // 1. Check active memtable (newest writes).
         if let Some(entry) = self.memtable.get_entry(key) {
             return entry.value.as_ref().map(|v| v.to_vec());
         }
 
-        // Check LRU cache (hot reads).
+        // 2. Check frozen memtables (recently flushed, newest first).
+        for frozen in self.frozen.iter().rev() {
+            if let Some(entry) = frozen.get_entry(key) {
+                return entry.value.as_ref().map(|v| v.to_vec());
+            }
+        }
+
+        // 3. Check LRU cache (hot reads from compaction).
         let mut lru = self.cache.lock().unwrap();
         if let Some(val) = lru.get(key) {
             return Some(val);
         }
 
-        // Fall back to compacted pages.
+        // 4. Fall back to compacted pages.
         let state = self.compactor.state();
         let cm = state.lock().unwrap();
         let result = cm.get(key);
@@ -441,13 +451,23 @@ impl Engine {
             c.scan(start, end)
         };
 
-        // Memtable entries are newer than compacted pages and therefore
-        // take precedence over them.
+        // Frozen memtables are newer than compacted pages.
+        // Apply oldest frozen first, then newest.
+        for frozen in &self.frozen {
+            for (key, entry) in frozen.range(start, end) {
+                if let Some(value) = &entry.value {
+                    results.insert(key.to_vec(), value.clone());
+                } else {
+                    results.remove(key);
+                }
+            }
+        }
+
+        // Active memtable is newest, takes final precedence.
         for (key, entry) in self.memtable.range(start, end) {
             if let Some(value) = &entry.value {
                 results.insert(key.to_vec(), value.clone());
             } else {
-                // Memtable tombstone removes any older compacted value.
                 results.remove(key);
             }
         }
@@ -463,6 +483,8 @@ impl Engine {
         if !self.memtable.is_empty() {
             self.flush_memtable()?;
         }
+        // Clear frozen memtables since their data is now in pages.
+        self.frozen.clear();
         Ok(())
     }
 
@@ -534,7 +556,58 @@ impl Engine {
     pub fn total_deletes(&self) -> u64 { self.total_deletes.load(Ordering::Relaxed) }
 
     /// Data directory path.
-    /// Check if the LRU cache is empty without acquiring the lock.
+    /// Profiled GET for benchmark breakdown.
+    pub fn get_profiled(&self, key: &[u8], acc: &mut [u128; 4]) -> Option<Vec<u8>> {
+        let t0 = std::time::Instant::now();
+        self.total_gets.fetch_add(1, Ordering::Relaxed);
+
+        let t1 = std::time::Instant::now();
+        // Check active memtable
+        let entry = self.memtable.get_entry(key);
+        // Check frozen memtables if not in active
+        let frozen_entry = if entry.is_none() {
+            self.frozen.iter().rev().find_map(|f| f.get_entry(key))
+        } else {
+            None
+        };
+        let found_entry = entry.or(frozen_entry);
+        let t2 = std::time::Instant::now();
+
+        if let Some(e) = found_entry {
+            let result = e.value.as_ref().map(|v| v.to_vec());
+            let t3 = std::time::Instant::now();
+            acc[0] += (t1 - t0).as_nanos(); // atomic
+            acc[1] += (t2 - t1).as_nanos(); // memtable lookup
+            acc[2] += (t3 - t2).as_nanos(); // clone
+            acc[3] += 0;                     // cache/compaction
+            return result;
+        }
+
+        let mut lru = self.cache.lock().unwrap();
+        if let Some(val) = lru.get(key) {
+            let t3 = std::time::Instant::now();
+            acc[0] += (t1 - t0).as_nanos();
+            acc[1] += (t2 - t1).as_nanos();
+            acc[2] += 0;
+            acc[3] += (t3 - t2).as_nanos();
+            return Some(val);
+        }
+
+        let state = self.compactor.state();
+        let cm = state.lock().unwrap();
+        let result = cm.get(key);
+        if let Some(ref val) = result {
+            lru.insert(key.to_vec(), val.clone());
+        }
+        let t3 = std::time::Instant::now();
+        acc[0] += (t1 - t0).as_nanos();
+        acc[1] += (t2 - t1).as_nanos();
+        acc[2] += 0;
+        acc[3] += (t3 - t2).as_nanos();
+        result
+    }
+
+        /// Check if the LRU cache is empty without acquiring the lock.
     /// Uses try_lock to avoid blocking on contended paths.
     fn cache_empty(&self) -> bool {
         match self.cache.try_lock() {
@@ -550,11 +623,46 @@ impl Engine {
     // -- Internal helpers ----------------------------------------------------
 
     fn flush_memtable(&mut self) -> io::Result<()> {
-        let page = Self::memtable_to_page(&mut self.memtable);
+        // Swap active memtable with a fresh empty one.
+        // The old memtable becomes frozen (immutable, still readable).
+        let mut old = Memtable::new(self.flush_threshold);
+        std::mem::swap(&mut self.memtable, &mut old);
+
+        // Build page from frozen memtable and submit to compactor.
+        // This is fast: drain + sort + bloom happen here but the
+        // memtable is small (just hit threshold).
+        let page = Self::frozen_to_page(&mut old);
         self.compactor.submit(page)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        // Keep the frozen memtable for reads until compactor processes it.
+        // In the current design, compactor processes synchronously on its
+        // thread, so by the time we read from compaction levels, the page
+        // is there. We still keep frozen for safety during the gap.
+        self.frozen.push(old);
+
+        // Limit frozen memtables to avoid unbounded memory growth.
+        // Keep at most 2 frozen memtables; oldest ones have been
+        // compacted by now.
+        while self.frozen.len() > 2 {
+            self.frozen.remove(0);
+        }
+
         self.flush_count += 1;
         Ok(())
+    }
+
+    fn frozen_to_page(memtable: &mut Memtable) -> Page {
+        let entries = memtable.drain();
+        let mut page = Page::new(0);
+        for (key, entry) in entries {
+            let tombstone = entry.value.is_none();
+            let value = entry.value.unwrap_or_default();
+            page.push(key, value, tombstone);
+        }
+        page.sort();
+        page.build_bloom();
+        page
     }
 
     fn memtable_to_page(memtable: &mut Memtable) -> Page {

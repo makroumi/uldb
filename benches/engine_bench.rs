@@ -497,7 +497,104 @@ fn main() {
     println!("\n--- STORAGE ---");
     bench_disk_footprint(10_000);
 
-    println!("\n--- PUT BREAKDOWN ---");
+    println!("\n--- GET BREAKDOWN ---");
+    {
+        let dir = tmp_dir("get_profile");
+        let config = EngineConfig::new(&dir);
+        let mut engine = Engine::open(config).unwrap();
+
+        // Seed 100K records
+        for i in 0..100_000u64 {
+            let key = format!("gp_{i:08}");
+            let val = format!("val_{i}_padding_xxxxxxxxxxxx");
+            engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+        }
+
+        let n = 100_000u64;
+
+        // Pre-build keys to avoid format! cost in measurement
+        let keys: Vec<Vec<u8>> = (0..n)
+            .map(|i| format!("gp_{i:08}").into_bytes())
+            .collect();
+
+        // Profiled GET with per-component timing
+        let mut acc = [0u128; 4];
+        let start = Instant::now();
+        for key in &keys {
+            let _ = engine.get_profiled(key, &mut acc);
+        }
+        let total = start.elapsed();
+
+        let labels = ["atomic_inc", "memtable", "clone_val", "cache/comp"];
+        let measured: u128 = acc.iter().sum();
+        println!("  GET total:          {:.0}ns/op ({:.0}K ops/sec)",
+            total.as_nanos() as f64 / n as f64,
+            n as f64 / total.as_secs_f64() / 1000.0);
+        for (i, label) in labels.iter().enumerate() {
+            println!("    {label:12} {:>5}ns  ({:.1}%)",
+                acc[i] / n as u128,
+                acc[i] as f64 / measured as f64 * 100.0);
+        }
+        println!("    overhead:    {:>5}ns (Instant::now calls)",
+            (total.as_nanos() as u128).saturating_sub(measured) / n as u128);
+
+        drop(engine);
+        cleanup(&dir);
+    }
+
+    println!("\n--- BM25 QUERY BREAKDOWN ---");
+    {
+        let dir = tmp_dir("query_profile");
+        let config = EngineConfig::new(&dir);
+        let mut engine = Engine::open(config).unwrap();
+
+        // Index 10K docs
+        for i in 0..10_000u64 {
+            let key = format!("doc_{i:06}");
+            let val = format!("def validate_token_{i}(jwt): return authenticate(jwt, token_{i})");
+            engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+        }
+
+        let queries = [
+            "validate token authentication JWT",
+            "hash password bcrypt salt",
+            "database connection query pool",
+        ];
+
+        let n = 1000u64;
+
+        // Total query time
+        let start = Instant::now();
+        for i in 0..n {
+            let q = queries[i as usize % queries.len()];
+            let spec = QuerySpec {
+                text: q.to_string(),
+                top_k: 10,
+                ..Default::default()
+            };
+            let _ = engine.indices.query(&spec);
+        }
+        let total = start.elapsed();
+
+        // Tokenize only
+        let start2 = Instant::now();
+        for i in 0..n {
+            let q = queries[i as usize % queries.len()];
+            std::hint::black_box(q.split_whitespace().collect::<Vec<_>>());
+        }
+        let tok_time = start2.elapsed();
+
+        println!("  BM25 query total:   {:.0}us/query ({:.0} queries/sec)",
+            total.as_nanos() as f64 / n as f64 / 1000.0,
+            n as f64 / total.as_secs_f64());
+        println!("  Tokenize only:      {:.0}ns/query",
+            tok_time.as_nanos() as f64 / n as f64);
+
+        drop(engine);
+        cleanup(&dir);
+    }
+
+        println!("\n--- PUT BREAKDOWN ---");
     {
         let dir = tmp_dir("put_profile");
         let config = EngineConfig::new(&dir);

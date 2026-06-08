@@ -1,73 +1,90 @@
 // src/storage/cache.rs
 //
-// Simple bounded LRU cache for hot key acceleration.
+// HashMap-backed LRU cache for hot key acceleration.
 //
-// Uses a Vec of (key, value) entries with LRU eviction.
-// On hit: entry is moved to the back (most recently used).
-// On miss: caller fetches from storage and calls insert().
-// On insert when full: front entry (least recently used) is evicted.
-//
-// This is intentionally simple. For production scale (>10K entries),
-// replace with a proper hash-indexed LRU. For typical agentic workloads
-// where the working set is small (hundreds of symbols), Vec-based LRU
-// is cache-line friendly and fast.
+// Uses HashMap for O(1) lookup and a generation counter for LRU eviction.
+// On get: returns value, updates generation (marks as recently used).
+// On insert when full: evicts entry with lowest generation.
 //
 // Complexity:
-//   get:    O(n) scan, n <= capacity (typically 1024)
-//   insert: O(n) for eviction shift
+//   get:    O(1) HashMap lookup
+//   insert: O(1) amortized, O(n) worst case on eviction scan
 //   clear:  O(1)
-//
-// Thread safety: NOT thread-safe. Engine wraps in RwLock externally.
+
+use std::collections::HashMap;
 
 /// Default cache capacity: 1024 entries.
 pub const DEFAULT_CACHE_CAPACITY: usize = 1024;
 
+struct CacheEntry {
+    value: Vec<u8>,
+    generation: u64,
+}
+
 pub struct LruCache {
-    entries: Vec<(Vec<u8>, Vec<u8>)>,
+    entries: HashMap<Vec<u8>, CacheEntry>,
     capacity: usize,
+    generation: u64,
 }
 
 impl LruCache {
     pub fn new(capacity: usize) -> Self {
         Self {
-            entries: Vec::with_capacity(capacity.min(4096)),
+            entries: HashMap::with_capacity(capacity),
             capacity,
+            generation: 0,
         }
     }
 
-    /// Look up a key. On hit, moves the entry to the back (MRU position).
+    /// O(1) lookup. On hit, updates generation (marks as MRU).
     pub fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
-        if let Some(pos) = self.entries.iter().position(|(k, _)| k == key) {
-            let entry = self.entries.remove(pos);
-            let value = entry.1.clone();
-            self.entries.push(entry);
-            Some(value)
-        } else {
-            None
+        if let Some(entry) = self.entries.get_mut(key) {
+            self.generation += 1;
+            entry.generation = self.generation;
+            return Some(entry.value.clone());
         }
+        None
     }
 
-    /// Insert a key-value pair. Evicts the LRU entry if at capacity.
+    /// Insert a key-value pair. Evicts LRU entry if at capacity.
     pub fn insert(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        // Remove existing entry for this key if present
-        if let Some(pos) = self.entries.iter().position(|(k, _)| k == &key) {
-            self.entries.remove(pos);
+        self.generation += 1;
+
+        // Update existing
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.value = value;
+            entry.generation = self.generation;
+            return;
         }
 
-        // Evict LRU (front) if at capacity
+        // Evict LRU if at capacity
         if self.entries.len() >= self.capacity {
-            self.entries.remove(0);
+            // Find the entry with the lowest generation
+            let mut min_gen = u64::MAX;
+            let mut min_key: Option<Vec<u8>> = None;
+            for (k, e) in self.entries.iter() {
+                if e.generation < min_gen {
+                    min_gen = e.generation;
+                    min_key = Some(k.clone());
+                }
+            }
+            if let Some(k) = min_key {
+                self.entries.remove(&k);
+            }
         }
 
-        self.entries.push((key, value));
+        self.entries.insert(key, CacheEntry {
+            value,
+            generation: self.generation,
+        });
     }
 
-    /// Invalidate a specific key.
+    /// Invalidate a specific key. O(1).
     pub fn invalidate(&mut self, key: &[u8]) {
-        self.entries.retain(|(k, _)| k != key);
+        self.entries.remove(key);
     }
 
-    /// Clear the entire cache.
+    /// Clear the entire cache. O(1).
     pub fn clear(&mut self) {
         self.entries.clear();
     }
