@@ -14,10 +14,10 @@
 //
 // Thread safety: NOT thread-safe internally. Engine wraps in Mutex.
 
-use crate::index::bm25::{Bm25Index, Bm25Result};
-use crate::index::fuzzy::{FuzzyMatcher, FuzzyMatch};
-use crate::index::hnsw::{HnswIndex, SearchResult as HnswResult};
-use crate::index::graph::{RelationGraph, Relation, TraversalResult};
+use crate::index::bm25::Bm25Index;
+use crate::index::fuzzy::FuzzyMatcher;
+use crate::index::hnsw::HnswIndex;
+use crate::index::graph::{RelationGraph, Relation};
 use crate::query::planner::{QuerySpec, QueryStep, QueryPlanner, RankedHit, merge_rrf};
 
 /// Default HNSW vector dimension. Set to 0 to disable until first vector arrives.
