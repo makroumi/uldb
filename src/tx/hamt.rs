@@ -210,7 +210,7 @@ fn insert_node(
         None => Node::new_leaf(hash, key, value),
 
         Some(n) => match n.as_ref() {
-            Node::Leaf { hash: existing_hash, key: existing_key, value: existing_value } => {
+            Node::Leaf { hash: existing_hash, key: existing_key, value: _existing_value } => {
                 if existing_key == &key {
                     // Same key: replace value.
                     Node::new_leaf(hash, key, value)

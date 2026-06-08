@@ -19,7 +19,7 @@
 //   search:       O(sum postings(qi)) for query terms qi
 //   space:        O(total_term_occurrences + vocabulary)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// One search result from the BM25 index.
 #[derive(Debug, Clone)]
