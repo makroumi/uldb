@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use crate::storage::wal::{WalWriter, WalReader};
 use crate::storage::memtable::Memtable;
 use crate::storage::page::Page;
-use crate::storage::compaction::CompactionManager;
+use crate::storage::bg_compaction::BackgroundCompactor;
 use crate::index::manager::IndexManager;
 use crate::tx::hamt::Hamt;
 
@@ -85,7 +85,7 @@ pub struct Engine {
     data_dir: PathBuf,
     wal: WalWriter,
     memtable: Memtable,
-    compaction: CompactionManager,
+    compactor: BackgroundCompactor,
     pub indices: IndexManager,
     pub state: Hamt,
     snapshots: HashMap<String, Hamt>,
@@ -109,7 +109,7 @@ impl Engine {
 
         // Replay existing WAL if present.
         let mut memtable = Memtable::new(config.flush_threshold);
-        let mut compaction = CompactionManager::new();
+        let compactor = BackgroundCompactor::new();
         let mut indices = IndexManager::new();
 
         if wal_path.exists() {
@@ -141,7 +141,7 @@ impl Engine {
             // If memtable exceeded threshold during replay, flush it.
             if memtable.should_flush() {
                 let page = Self::memtable_to_page(&mut memtable);
-                compaction.add_l0_page(page);
+                let _ = compactor.submit(page);
             }
         }
 
@@ -161,7 +161,7 @@ impl Engine {
             data_dir: config.data_dir,
             wal,
             memtable,
-            compaction,
+            compactor,
             indices,
             state: initial_state,
             snapshots: HashMap::new(),
@@ -218,7 +218,9 @@ impl Engine {
         }
 
         // Fall back to compacted pages.
-        self.compaction.get(key)
+        let state = self.compactor.state();
+        let c = state.lock().unwrap();
+        c.get(key)
     }
 
     /// Delete one key by writing a tombstone.
@@ -291,6 +293,7 @@ impl Engine {
     pub fn close(mut self) -> io::Result<()> {
         self.flush()?;
         self.wal.sync()?;
+        self.compactor.shutdown();
         Ok(())
     }
 
@@ -311,12 +314,16 @@ impl Engine {
 
     /// Total number of compactions.
     pub fn compaction_count(&self) -> u64 {
-        self.compaction.compaction_count()
+        let state = self.compactor.state();
+        let c = state.lock().unwrap();
+        c.compaction_count()
     }
 
     /// Total records across all compaction levels.
     pub fn compaction_records(&self) -> usize {
-        self.compaction.total_records()
+        let state = self.compactor.state();
+        let c = state.lock().unwrap();
+        c.total_records()
     }
 
     pub fn total_puts(&self) -> u64 { self.total_puts }
@@ -332,7 +339,8 @@ impl Engine {
 
     fn flush_memtable(&mut self) -> io::Result<()> {
         let page = Self::memtable_to_page(&mut self.memtable);
-        self.compaction.add_l0_page(page);
+        self.compactor.submit(page)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         self.flush_count += 1;
         Ok(())
     }
@@ -655,6 +663,7 @@ mod tests {
         }
 
         assert!(engine.flush_count() > 0, "should have flushed");
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Data should still be readable from compaction levels.
         assert!(engine.get(b"flush_key_0000").is_some());
