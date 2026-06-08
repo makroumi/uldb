@@ -34,15 +34,22 @@ fn normalize(s: &str) -> String {
 
 /// Extract character trigrams from a string, with edge padding.
 /// "hello" -> {"##h", "#he", "hel", "ell", "llo", "lo#", "o##"}
-fn trigrams(s: &str) -> Vec<String> {
+fn trigrams(s: &str) -> Vec<[u8; 3]> {
     if s.is_empty() {
         return Vec::new();
     }
-    let padded = format!("##{s}##");
-    let chars: Vec<char> = padded.chars().collect();
-    (0..chars.len().saturating_sub(2))
-        .map(|i| chars[i..i + 3].iter().collect())
-        .collect()
+    // All inputs are ASCII after normalize(), so byte indexing is safe.
+    let mut padded = Vec::with_capacity(s.len() + 4);
+    padded.extend_from_slice(b"##");
+    padded.extend_from_slice(s.as_bytes());
+    padded.extend_from_slice(b"##");
+
+    let n = padded.len().saturating_sub(2);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push([padded[i], padded[i + 1], padded[i + 2]]);
+    }
+    out
 }
 
 /// Bounded Levenshtein edit distance. Returns max_dist+1 if exceeded.
@@ -94,7 +101,7 @@ pub struct FuzzyMatcher {
     symbols: Vec<String>,           // original symbol names
     normalized: Vec<String>,        // normalized forms
     tri_counts: Vec<usize>,         // trigram count per symbol
-    index: HashMap<String, Vec<usize>>,  // trigram -> [symbol indices]
+    index: HashMap<[u8; 3], Vec<usize>>,  // trigram -> [symbol indices]
     max_distance: usize,
 }
 
@@ -114,18 +121,18 @@ impl FuzzyMatcher {
         let idx = self.symbols.len();
         let norm = normalize(symbol);
         let trigs = trigrams(&norm);
-        let tri_count = trigs.len();
 
         self.symbols.push(symbol.to_string());
         self.normalized.push(norm);
-        self.tri_counts.push(tri_count);
 
-        // Deduplicate trigrams for this symbol to avoid inflating hit counts
-        let mut seen = std::collections::HashSet::new();
-        for tg in trigs {
-            if seen.insert(tg.clone()) {
-                self.index.entry(tg).or_default().push(idx);
-            }
+        // Deduplicate trigrams using sort+dedup (no heap alloc per trigram)
+        let mut unique = trigs;
+        unique.sort_unstable();
+        unique.dedup();
+        self.tri_counts.push(unique.len());
+
+        for tg in unique {
+            self.index.entry(tg).or_default().push(idx);
         }
     }
 
@@ -142,22 +149,20 @@ impl FuzzyMatcher {
         max_distance: usize,
     ) -> Vec<FuzzyMatch> {
         let q_norm = normalize(q);
-        let q_trigs = trigrams(&q_norm);
+        let mut q_trigs = trigrams(&q_norm);
         if q_trigs.is_empty() {
             return Vec::new();
         }
 
         // Deduplicate query trigrams
-        let mut q_trig_set = std::collections::HashSet::new();
-        for tg in &q_trigs {
-            q_trig_set.insert(tg.as_str());
-        }
-        let q_tri_n = q_trig_set.len();
+        q_trigs.sort_unstable();
+        q_trigs.dedup();
+        let q_tri_n = q_trigs.len();
 
         // Phase 1: count trigram hits per candidate
         let mut hit_count: HashMap<usize, usize> = HashMap::new();
-        for tg in &q_trig_set {
-            if let Some(indices) = self.index.get(*tg) {
+        for tg in &q_trigs {
+            if let Some(indices) = self.index.get(tg) {
                 for &idx in indices {
                     *hit_count.entry(idx).or_default() += 1;
                 }

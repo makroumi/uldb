@@ -41,9 +41,13 @@ pub struct Bm25Result {
 ///   doc_len: token count per document
 pub struct Bm25Index {
     docs: Vec<Vec<u8>>,
+    key_to_doc: HashMap<Vec<u8>, usize>,
+    doc_terms: Vec<Vec<String>>,
     df: HashMap<String, u32>,
     postings: HashMap<String, Vec<(usize, u32)>>,
     doc_len: Vec<u32>,
+    total_doc_len: u64,
+    active_docs: usize,
     avgdl: f64,
     k1: f64,
     b: f64,
@@ -54,9 +58,13 @@ impl Bm25Index {
     pub fn new() -> Self {
         Self {
             docs: Vec::new(),
+            key_to_doc: HashMap::new(),
+            doc_terms: Vec::new(),
             df: HashMap::new(),
             postings: HashMap::new(),
             doc_len: Vec::new(),
+            total_doc_len: 0,
+            active_docs: 0,
             avgdl: 0.0,
             k1: 1.5,
             b: 0.75,
@@ -67,9 +75,13 @@ impl Bm25Index {
     pub fn with_params(k1: f64, b: f64) -> Self {
         Self {
             docs: Vec::new(),
+            key_to_doc: HashMap::new(),
+            doc_terms: Vec::new(),
             df: HashMap::new(),
             postings: HashMap::new(),
             doc_len: Vec::new(),
+            total_doc_len: 0,
+            active_docs: 0,
             avgdl: 0.0,
             k1,
             b,
@@ -103,71 +115,78 @@ impl Bm25Index {
     /// Complexity: O(tokens)
     pub fn add_document(&mut self, key: Vec<u8>, content: &str) {
         let doc_id = self.docs.len();
+        self.key_to_doc.insert(key.clone(), doc_id);
         self.docs.push(key);
 
         let tokens = tokenize(content);
         let len = tokens.len() as u32;
         self.doc_len.push(len);
 
-        // term frequencies within this document
-        let mut tf: HashMap<String, u32> = HashMap::new();
+        // term frequencies: reuse tokens Vec, count in-place
+        let mut tf: HashMap<String, u32> = HashMap::with_capacity(tokens.len());
         for tok in tokens {
             *tf.entry(tok).or_insert(0) += 1;
         }
 
-        // update document frequency and postings
+        // Store terms and update postings in a single pass (no extra clone)
+        let mut terms = Vec::with_capacity(tf.len());
         for (term, freq) in tf {
             self.postings.entry(term.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push((doc_id, freq));
-            *self.df.entry(term).or_insert(0) += 1;
+            *self.df.entry(term.clone()).or_insert(0) += 1;
+            terms.push(term);
         }
+        self.doc_terms.push(terms);
 
-        // update average document length
-        let total_len: u64 = self.doc_len.iter().map(|&l| l as u64).sum();
-        self.avgdl = total_len as f64 / self.doc_len.len() as f64;
+        // update average document length incrementally O(1)
+        self.total_doc_len += len as u64;
+        self.active_docs += 1;
+        self.avgdl = self.total_doc_len as f64 / self.active_docs as f64;
     }
 
     /// Remove a document from the index by key.
     ///
     /// Removes the document from postings, decrements df, and
     /// recalculates avgdl. Used when a key is deleted or overwritten.
-    pub fn remove_document(&mut self, key: &[u8]) {
-        // Find the doc_id for this key
-        let doc_id = match self.docs.iter().position(|k| k == key) {
+    /// Check if a key is currently indexed. O(1).
+    pub fn contains_key(&self, key: &[u8]) -> bool {
+        self.key_to_doc.contains_key(key)
+    }
+
+        pub fn remove_document(&mut self, key: &[u8]) {
+        // O(1) lookup via key_to_doc HashMap
+        let doc_id = match self.key_to_doc.remove(key) {
             Some(id) => id,
             None => return, // not indexed
         };
 
-
-        // Remove from postings and update df
-        let mut empty_terms = Vec::new();
-        for (term, entries) in self.postings.iter_mut() {
-            let before = entries.len();
-            entries.retain(|(id, _)| *id != doc_id);
-            if entries.len() < before {
-                if let Some(df) = self.df.get_mut(term) {
-                    *df = df.saturating_sub(1);
+        // Only touch posting lists for terms this document contains.
+        // This is O(terms_in_doc) instead of O(all_terms_in_index).
+        if doc_id < self.doc_terms.len() {
+            let terms = std::mem::take(&mut self.doc_terms[doc_id]);
+            for term in &terms {
+                if let Some(entries) = self.postings.get_mut(term.as_str()) {
+                    entries.retain(|(id, _)| *id != doc_id);
+                    if let Some(df) = self.df.get_mut(term.as_str()) {
+                        *df = df.saturating_sub(1);
+                    }
+                    if entries.is_empty() {
+                        self.postings.remove(term.as_str());
+                        self.df.remove(term.as_str());
+                    }
                 }
             }
-            if entries.is_empty() {
-                empty_terms.push(term.clone());
-            }
-        }
-        for term in empty_terms {
-            self.postings.remove(&term);
-            self.df.remove(&term);
         }
 
-        // Mark doc as removed (empty key so it won't match future lookups)
+        // Mark doc as removed; update counters incrementally
+        let removed_len = self.doc_len[doc_id] as u64;
         self.docs[doc_id] = Vec::new();
         self.doc_len[doc_id] = 0;
-
-        // Recalculate avgdl
-        let total_len: u64 = self.doc_len.iter().map(|&l| l as u64).sum();
-        let active_docs = self.docs.iter().filter(|k| !k.is_empty()).count();
-        self.avgdl = if active_docs > 0 {
-            total_len as f64 / active_docs as f64
+        self.total_doc_len = self.total_doc_len.saturating_sub(removed_len);
+        self.active_docs = self.active_docs.saturating_sub(1);
+        self.avgdl = if self.active_docs > 0 {
+            self.total_doc_len as f64 / self.active_docs as f64
         } else {
             0.0
         };
@@ -246,22 +265,49 @@ impl Bm25Index {
 /// Example:
 ///   "getUserById and validate_token" -> ["get", "user", "by", "id", "and", "validate", "token"]
 fn tokenize(text: &str) -> Vec<String> {
-    // Insert spaces before CamelCase boundaries.
-    let mut expanded = String::with_capacity(text.len() * 2);
-    let chars: Vec<char> = text.chars().collect();
-    for i in 0..chars.len() {
-        let c = chars[i];
-        if i > 0 && c.is_ascii_uppercase() && chars[i - 1].is_ascii_lowercase() {
-            expanded.push(' ');
+    // Fast tokenizer: processes bytes directly, avoids intermediate
+    // String allocation for camelCase expansion.
+    let bytes = text.as_bytes();
+    let mut tokens = Vec::new();
+    let mut start = 0;
+    let mut in_token = false;
+
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        // Check for camelCase boundary: lowercase followed by uppercase
+        if i > 0 && b.is_ascii_uppercase() && bytes[i - 1].is_ascii_lowercase() && in_token {
+            // Emit the token before the uppercase letter
+            if start < i {
+                let tok = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
+                tokens.push(tok.to_ascii_lowercase());
+            }
+            start = i;
         }
-        expanded.push(c.to_ascii_lowercase());
+
+        if b.is_ascii_alphanumeric() {
+            if !in_token {
+                start = i;
+                in_token = true;
+            }
+        } else {
+            if in_token {
+                let tok = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
+                tokens.push(tok.to_ascii_lowercase());
+                in_token = false;
+            }
+        }
+        i += 1;
     }
 
-    expanded
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
+    // Emit last token
+    if in_token && start < bytes.len() {
+        let tok = unsafe { std::str::from_utf8_unchecked(&bytes[start..]) };
+        tokens.push(tok.to_ascii_lowercase());
+    }
+
+    tokens
 }
 
 #[cfg(test)]

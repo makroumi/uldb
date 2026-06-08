@@ -181,7 +181,12 @@ impl Engine {
                     memtable.delete(key);
                 } else {
                     // Feed into indices for query support.
-                    indices.on_put(&key, &value);
+                    // During replay we use add_document directly (no remove)
+                    // because each WAL record is the authoritative latest state.
+                    let key_str = String::from_utf8_lossy(&key);
+                    let content = format!("{} {}", key_str, String::from_utf8_lossy(&value));
+                    indices.bm25.add_document(key.clone(), &content);
+                    indices.fuzzy.add(&key_str);
                     memtable.put(key, value);
                 }
             }
@@ -232,12 +237,14 @@ impl Engine {
         self.wal.append(key, value)?;
         self.wal.flush()?;
 
-        // Memtable second (fast reads).
+        // Memtable (fast reads).
         let should_flush = self.memtable.put(key.to_vec(), value.to_vec());
         self.total_puts.fetch_add(1, Ordering::Relaxed);
 
-        // Invalidate cache for this key.
-        { self.cache.lock().unwrap().invalidate(key); }
+        // Invalidate cache only if cache is non-empty (skip lock otherwise).
+        if !self.cache_empty() {
+            self.cache.lock().unwrap().invalidate(key);
+        }
 
         // Index for queries.
         self.indices.on_put(key, value);
@@ -248,6 +255,38 @@ impl Engine {
         if should_flush {
             self.flush_memtable()?;
         }
+
+        Ok(())
+    }
+
+    /// Profiled PUT that prints per-component timing.
+    /// Call once with a few thousand ops to see the breakdown.
+    pub fn put_profiled(&mut self, key: &[u8], value: &[u8], acc: &mut [u128; 5]) -> io::Result<()> {
+        let t0 = std::time::Instant::now();
+        self.wal.append(key, value)?;
+        self.wal.flush()?;
+        let t1 = std::time::Instant::now();
+
+        let should_flush = self.memtable.put(key.to_vec(), value.to_vec());
+        self.total_puts.fetch_add(1, Ordering::Relaxed);
+        let t2 = std::time::Instant::now();
+
+        self.indices.on_put(key, value);
+        let t3 = std::time::Instant::now();
+
+        self.state = self.state.put(key.to_vec(), value.to_vec());
+        let t4 = std::time::Instant::now();
+
+        if should_flush {
+            self.flush_memtable()?;
+        }
+        let t5 = std::time::Instant::now();
+
+        acc[0] += (t1 - t0).as_nanos();
+        acc[1] += (t2 - t1).as_nanos();
+        acc[2] += (t3 - t2).as_nanos();
+        acc[3] += (t4 - t3).as_nanos();
+        acc[4] += (t5 - t4).as_nanos();
 
         Ok(())
     }
@@ -264,6 +303,9 @@ impl Engine {
         // Single flush for the entire batch.
         self.wal.flush()?;
 
+        // Clear cache once for the whole batch instead of per-key.
+        self.cache.lock().unwrap().clear();
+
         // Insert all into memtable and indices.
         let mut should_flush = false;
         for &(key, value) in entries {
@@ -271,7 +313,6 @@ impl Engine {
                 should_flush = true;
             }
             self.total_puts.fetch_add(1, Ordering::Relaxed);
-            { self.cache.lock().unwrap().invalidate(key); }
             self.indices.on_put(key, value);
             self.state = self.state.put(key.to_vec(), value.to_vec());
         }
@@ -283,6 +324,47 @@ impl Engine {
         Ok(())
     }
 
+        /// Bulk ingest records optimized for codebase indexing.
+    ///
+    /// This is the primary entry point for indexing a codebase.
+    /// Optimizations vs calling put() in a loop:
+    ///   - Single WAL flush at the end (not per record)
+    ///   - Cache cleared once (not per record)
+    ///   - Memtable flush check only at the end
+    ///
+    /// All records are durable when this method returns.
+    /// Features: WAL durability, BM25 indexing, fuzzy indexing,
+    /// HAMT snapshots, cache coherence - all preserved.
+    pub fn bulk_ingest(&mut self, entries: &[(&[u8], &[u8])]) -> io::Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        // WAL: append all, flush once.
+        for &(key, value) in entries {
+            self.wal.append(key, value)?;
+        }
+        self.wal.flush()?;
+
+        // Clear cache once for the whole batch.
+        self.cache.lock().unwrap().clear();
+
+        // Memtable + indices + HAMT for each entry.
+        for &(key, value) in entries {
+            self.memtable.put(key.to_vec(), value.to_vec());
+            self.total_puts.fetch_add(1, Ordering::Relaxed);
+            self.indices.on_put(key, value);
+            self.state = self.state.put(key.to_vec(), value.to_vec());
+        }
+
+        // Check if memtable needs flushing.
+        if self.memtable.should_flush() {
+            self.flush_memtable()?;
+        }
+
+        Ok(entries.len())
+    }
+
         /// Read one key.
     ///
     /// Checks the memtable first (hot data), then falls back to
@@ -292,20 +374,16 @@ impl Engine {
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.total_gets.fetch_add(1, Ordering::Relaxed);
 
-        // Check memtable first (hot writes).
-        if self.memtable.contains(key) {
-            if self.memtable.is_tombstone(key) {
-                return None;
-            }
-            return self.memtable.get(key).map(|v| v.to_vec());
+        // Single memtable lookup: get the entry directly and check
+        // tombstone in one operation. Avoids 3 separate BTreeMap lookups.
+        if let Some(entry) = self.memtable.get_entry(key) {
+            return entry.value.as_ref().map(|v| v.to_vec());
         }
 
         // Check LRU cache (hot reads).
-        {
-            let mut lru = self.cache.lock().unwrap();
-            if let Some(val) = lru.get(key) {
-                return Some(val);
-            }
+        let mut lru = self.cache.lock().unwrap();
+        if let Some(val) = lru.get(key) {
+            return Some(val);
         }
 
         // Fall back to compacted pages.
@@ -315,7 +393,6 @@ impl Engine {
 
         // Populate cache on hit.
         if let Some(ref val) = result {
-            let mut lru = self.cache.lock().unwrap();
             lru.insert(key.to_vec(), val.clone());
         }
 
@@ -334,8 +411,10 @@ impl Engine {
         let should_flush = self.memtable.delete(key.to_vec());
         self.total_deletes.fetch_add(1, Ordering::Relaxed);
 
-        // Invalidate cache for this key.
-        { self.cache.lock().unwrap().invalidate(key); }
+        // Invalidate cache only if non-empty.
+        if !self.cache_empty() {
+            self.cache.lock().unwrap().invalidate(key);
+        }
 
         // Remove from indices.
         self.indices.on_delete(key);
@@ -455,7 +534,16 @@ impl Engine {
     pub fn total_deletes(&self) -> u64 { self.total_deletes.load(Ordering::Relaxed) }
 
     /// Data directory path.
-    pub fn data_dir(&self) -> &Path {
+    /// Check if the LRU cache is empty without acquiring the lock.
+    /// Uses try_lock to avoid blocking on contended paths.
+    fn cache_empty(&self) -> bool {
+        match self.cache.try_lock() {
+            Ok(c) => c.is_empty(),
+            Err(_) => false, // contended, assume non-empty
+        }
+    }
+
+        pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 

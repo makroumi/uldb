@@ -48,21 +48,29 @@ impl IndexManager {
     /// Called when a record is written.
     /// Updates BM25 and fuzzy indices with the key and value.
     pub fn on_put(&mut self, key: &[u8], value: &[u8]) {
-        let key_str = String::from_utf8_lossy(key);
+        // Only remove old entry if this key was previously indexed.
+        if self.bm25.contains_key(key) {
+            self.bm25.remove_document(key);
+        }
 
-        // Remove old entry if overwriting (prevents stale BM25 results)
-        self.bm25.remove_document(key);
-
-        // BM25: index key + value text
-        let content = format!(
-            "{} {}",
-            key_str,
-            String::from_utf8_lossy(value)
-        );
+        // BM25: build content string with minimal allocation.
+        // Most keys and values are valid UTF-8 (code text).
+        let mut content = String::with_capacity(key.len() + 1 + value.len());
+        match std::str::from_utf8(key) {
+            Ok(s) => content.push_str(s),
+            Err(_) => content.push_str(&String::from_utf8_lossy(key)),
+        }
+        content.push(' ');
+        match std::str::from_utf8(value) {
+            Ok(s) => content.push_str(s),
+            Err(_) => content.push_str(&String::from_utf8_lossy(value)),
+        }
         self.bm25.add_document(key.to_vec(), &content);
 
-        // Fuzzy: index the key as a symbol name
-        self.fuzzy.add(&key_str);
+        // Fuzzy: index the key as a symbol name.
+        // Use the key portion of content (already UTF-8 validated above).
+        let key_end = key.len();
+        self.fuzzy.add(&content[..key_end]);
     }
 
     /// Called when a record is deleted.

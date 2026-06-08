@@ -45,3 +45,8 @@ required-features = ["server"]
 name = "scan_read_through"
 path = "tests/rust/scan_read_through.rs"
 required-features = ["server"]
+
+[[bench]]
+name = "engine_bench"
+path = "benches/engine_bench.rs"
+harness = false

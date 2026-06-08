@@ -96,7 +96,14 @@ impl Memtable {
             .and_then(|e| e.value.as_deref())
     }
 
-    /// Check if a key exists (even as tombstone).
+    /// Get the entry for a key directly. Single BTreeMap lookup.
+    /// Returns None if key is not in memtable at all.
+    /// Returns Some(entry) if key exists (check entry.value for tombstone).
+    pub fn get_entry(&self, key: &[u8]) -> Option<&MemEntry> {
+        self.entries.get(key)
+    }
+
+        /// Check if a key exists (even as tombstone).
     pub fn contains(&self, key: &[u8]) -> bool {
         self.entries.contains_key(key)
     }
