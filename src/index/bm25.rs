@@ -42,9 +42,11 @@ pub struct Bm25Result {
 pub struct Bm25Index {
     docs: Vec<Vec<u8>>,
     key_to_doc: HashMap<Vec<u8>, usize>,
-    doc_terms: Vec<Vec<String>>,
-    df: HashMap<String, u32>,
-    postings: HashMap<String, Vec<(usize, u32)>>,
+    term_pool: Vec<String>,
+    term_ids: HashMap<String, u32>,
+    doc_terms: Vec<Vec<u32>>,
+    df: HashMap<u32, u32>,
+    postings: HashMap<u32, Vec<(usize, u32)>>,
     doc_len: Vec<u32>,
     total_doc_len: u64,
     active_docs: usize,
@@ -59,6 +61,8 @@ impl Bm25Index {
         Self {
             docs: Vec::new(),
             key_to_doc: HashMap::new(),
+            term_pool: Vec::new(),
+            term_ids: HashMap::new(),
             doc_terms: Vec::new(),
             df: HashMap::new(),
             postings: HashMap::new(),
@@ -76,6 +80,8 @@ impl Bm25Index {
         Self {
             docs: Vec::new(),
             key_to_doc: HashMap::new(),
+            term_pool: Vec::new(),
+            term_ids: HashMap::new(),
             doc_terms: Vec::new(),
             df: HashMap::new(),
             postings: HashMap::new(),
@@ -99,7 +105,7 @@ impl Bm25Index {
 
     /// Vocabulary size.
     pub fn vocab_size(&self) -> usize {
-        self.df.len()
+        self.term_ids.len()
     }
 
     /// Average document length.
@@ -123,29 +129,37 @@ impl Bm25Index {
         self.doc_len.push(len);
 
         // Sort tokens so identical terms are adjacent.
-        // Count term frequency by scanning runs. Avoids HashMap allocation.
         tokens.sort_unstable();
 
-        let mut terms = Vec::new();
+        let mut term_ids = Vec::new();
         let mut i = 0;
         while i < tokens.len() {
-            let term = &tokens[i];
             let mut freq = 1u32;
-            while i + (freq as usize) < tokens.len() && &tokens[i + freq as usize] == term {
+            while i + (freq as usize) < tokens.len() && tokens[i + freq as usize] == tokens[i] {
                 freq += 1;
             }
 
-            self.postings.entry(term.clone())
+            // Intern the term: reuse existing ID or assign new one.
+            let tid = match self.term_ids.get(&tokens[i]) {
+                Some(&id) => id,
+                None => {
+                    let id = self.term_pool.len() as u32;
+                    self.term_ids.insert(std::mem::take(&mut tokens[i]), id);
+                    self.term_pool.push(String::new()); // placeholder
+                    id
+                }
+            };
+
+            self.postings.entry(tid)
                 .or_default()
                 .push((doc_id, freq));
-            *self.df.entry(term.clone()).or_insert(0) += 1;
-            terms.push(std::mem::take(&mut tokens[i]));
+            *self.df.entry(tid).or_insert(0) += 1;
+            term_ids.push(tid);
 
             i += freq as usize;
         }
-        self.doc_terms.push(terms);
+        self.doc_terms.push(term_ids);
 
-        // update average document length incrementally O(1)
         self.total_doc_len += len as u64;
         self.active_docs += 1;
         self.avgdl = self.total_doc_len as f64 / self.active_docs as f64;
@@ -170,16 +184,16 @@ impl Bm25Index {
         // Only touch posting lists for terms this document contains.
         // This is O(terms_in_doc) instead of O(all_terms_in_index).
         if doc_id < self.doc_terms.len() {
-            let terms = std::mem::take(&mut self.doc_terms[doc_id]);
-            for term in &terms {
-                if let Some(entries) = self.postings.get_mut(term.as_str()) {
+            let term_ids = std::mem::take(&mut self.doc_terms[doc_id]);
+            for &tid in &term_ids {
+                if let Some(entries) = self.postings.get_mut(&tid) {
                     entries.retain(|(id, _)| *id != doc_id);
-                    if let Some(df) = self.df.get_mut(term.as_str()) {
+                    if let Some(df) = self.df.get_mut(&tid) {
                         *df = df.saturating_sub(1);
                     }
                     if entries.is_empty() {
-                        self.postings.remove(term.as_str());
-                        self.df.remove(term.as_str());
+                        self.postings.remove(&tid);
+                        self.df.remove(&tid);
                     }
                 }
             }
@@ -217,15 +231,22 @@ impl Bm25Index {
         let mut scores: HashMap<usize, f64> = HashMap::new();
 
         for term in q_terms {
-            let df = match self.df.get(&term) {
-                Some(&df) => df as f64,
+            let tid = match self.term_ids.get(&term) {
+                Some(&id) => id,
                 None => continue, // unseen term
+            };
+            let df = match self.df.get(&tid) {
+                Some(&df) => df as f64,
+                None => continue,
             };
 
             // BM25 IDF
             let idf = ((n_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
 
-            let postings = &self.postings[&term];
+            let postings = match self.postings.get(&tid) {
+                Some(p) => p,
+                None => continue,
+            };
             for &(doc_id, tf) in postings {
                 let tf = tf as f64;
                 let dl = self.doc_len[doc_id] as f64;
