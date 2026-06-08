@@ -169,7 +169,57 @@ impl Bm25Index {
     ///
     /// Removes the document from postings, decrements df, and
     /// recalculates avgdl. Used when a key is deleted or overwritten.
-    /// Check if a key is currently indexed. O(1).
+    /// Index a document from key and value text parts directly.
+    /// Avoids allocating a combined content String.
+    /// Tokenizes both parts separately and merges token counts.
+    pub fn add_document_parts(&mut self, key: Vec<u8>, key_text: &str, value_text: &str) {
+        let doc_id = self.docs.len();
+        self.key_to_doc.insert(key.clone(), doc_id);
+        self.docs.push(key);
+
+        // Tokenize both parts separately, merge into one sorted list.
+        let mut tokens = tokenize(key_text);
+        tokens.extend(tokenize(value_text));
+        let len = tokens.len() as u32;
+        self.doc_len.push(len);
+
+        // Sort for run-based tf counting.
+        tokens.sort_unstable();
+
+        let mut term_ids = Vec::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            let mut freq = 1u32;
+            while i + (freq as usize) < tokens.len() && tokens[i + freq as usize] == tokens[i] {
+                freq += 1;
+            }
+
+            let tid = match self.term_ids.get(&tokens[i]) {
+                Some(&id) => id,
+                None => {
+                    let id = self.term_pool.len() as u32;
+                    self.term_ids.insert(std::mem::take(&mut tokens[i]), id);
+                    self.term_pool.push(String::new());
+                    id
+                }
+            };
+
+            self.postings.entry(tid)
+                .or_default()
+                .push((doc_id, freq));
+            *self.df.entry(tid).or_insert(0) += 1;
+            term_ids.push(tid);
+
+            i += freq as usize;
+        }
+        self.doc_terms.push(term_ids);
+
+        self.total_doc_len += len as u64;
+        self.active_docs += 1;
+        self.avgdl = self.total_doc_len as f64 / self.active_docs as f64;
+    }
+
+        /// Check if a key is currently indexed. O(1).
     pub fn contains_key(&self, key: &[u8]) -> bool {
         self.key_to_doc.contains_key(key)
     }

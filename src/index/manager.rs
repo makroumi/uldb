@@ -53,24 +53,13 @@ impl IndexManager {
             self.bm25.remove_document(key);
         }
 
-        // BM25: build content string with minimal allocation.
-        // Most keys and values are valid UTF-8 (code text).
-        let mut content = String::with_capacity(key.len() + 1 + value.len());
-        match std::str::from_utf8(key) {
-            Ok(s) => content.push_str(s),
-            Err(_) => content.push_str(&String::from_utf8_lossy(key)),
-        }
-        content.push(' ');
-        match std::str::from_utf8(value) {
-            Ok(s) => content.push_str(s),
-            Err(_) => content.push_str(&String::from_utf8_lossy(value)),
-        }
-        self.bm25.add_document(key.to_vec(), &content);
+        // BM25: index key and value text directly, no intermediate String.
+        let key_str = unsafe { std::str::from_utf8_unchecked(key) };
+        let val_str = unsafe { std::str::from_utf8_unchecked(value) };
+        self.bm25.add_document_parts(key.to_vec(), key_str, val_str);
 
         // Fuzzy: index the key as a symbol name.
-        // Use the key portion of content (already UTF-8 validated above).
-        let key_end = key.len();
-        self.fuzzy.add(&content[..key_end]);
+        self.fuzzy.add(key_str);
     }
 
     /// Called when a record is deleted.
