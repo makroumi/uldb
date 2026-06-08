@@ -404,20 +404,22 @@ impl Handler for UmpHandler {
 
         let all_hits = eng.indices.query(&spec);
 
-        // Filter hits by namespace if a namespace was specified.
-        // Index keys are stored with the handler's ns_id=0 prefix followed
-        // by the application-level namespace prefix. When a query specifies
-        // a namespace, we resolve it to a u64 and keep only hits whose key
-        // (after the handler's 8-byte prefix) belongs to that namespace.
-        let query_ns = resolve_ns(&msg.namespace);
-        let hits: Vec<_> = if query_ns != 0 {
-            let ns_prefix = query_ns.to_be_bytes();
+        // Filter hits by namespace if the query specifies a numeric namespace.
+        // Keys stored via handle_put use an 8-byte ns_id=0 prefix. When
+        // application-level namespace scoping is used (keys have a second
+        // 8-byte prefix at bytes 8..16), the filter matches that prefix.
+        //
+        // Only activate filtering when the namespace string is a raw numeric
+        // u64 (e.g. "12345"). String-named namespaces like "my_project" are
+        // not yet used as storage prefixes (handle_put always uses ns_id=0),
+        // so filtering by their hash would incorrectly reject all results.
+        let query_ns: Option<u64> = msg.namespace.parse::<u64>().ok()
+            .filter(|&ns| ns != 0);
+        let hits: Vec<_> = if let Some(ns) = query_ns {
+            let ns_prefix = ns.to_be_bytes();
             all_hits
                 .into_iter()
                 .filter(|hit| {
-                    // The hit key is the full stored key including the
-                    // handler's ns_id=0 prefix. The application namespace
-                    // starts at byte 8. Check if bytes 8..16 match.
                     hit.key.len() >= 16 && hit.key[8..16] == ns_prefix
                 })
                 .collect()
@@ -432,13 +434,14 @@ impl Handler for UmpHandler {
         ));
 
         for hit in &hits {
-            // Hit keys are already the full stored keys. Look up the value
-            // directly without re-scoping.
+            // Hit keys are the full stored keys (with ns_id=0 prefix).
+            // Look up the value directly.
             let value = eng.get(&hit.key).unwrap_or_default();
 
-            // Display key: strip the handler's ns_id=0 prefix, then strip
-            // the application namespace prefix if present.
-            let display_key = if hit.key.len() >= 16 {
+            // Display key: strip the handler's 8-byte ns_id=0 prefix.
+            // If namespace filtering was active (double-prefixed keys),
+            // also strip the application namespace prefix.
+            let display_key = if query_ns.is_some() && hit.key.len() >= 16 {
                 String::from_utf8_lossy(&hit.key[16..]).to_string()
             } else {
                 unscope_key(&hit.key)
