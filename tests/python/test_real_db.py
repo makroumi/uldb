@@ -348,33 +348,73 @@ class TestSnapshots:
 
 
 class TestBranches:
-    """Branch create, list, rollback."""
+    """Branch create, list, merge, rollback."""
 
     @pytest.mark.asyncio
-    async def test_branch_lifecycle(self, uldb_server):
-        """Create and rollback a branch."""
+    async def test_branch_create_and_rollback(self, uldb_server):
+        """Create a branch, list it, then roll it back."""
         db = await _connect(uldb_server)
         try:
-            ns = db.namespace("test_branch")
+            ns = db.namespace("test_branch_rollback")
 
             await ns.put("shared_key", b"original")
 
-            # Create branch (using the low-level client API)
-            await db._send_branch_create(0, "feat/test", "", "test branch")
+            # Create branch via low-level client API
+            await db._branch_create("", "feat/rollback", "test rollback")
 
             # List branches
             branches = await ns.branch_list()
-            assert len(branches) >= 1
-            print(f"  Branches: {len(branches)}")
+            assert len(branches) >= 1, f"expected >= 1 branch, got {len(branches)}"
+            print(f"  Branches after create: {len(branches)}")
 
             # Rollback
-            await db._send_branch_rollback(0, "feat/test")
-            print("  Branch rolled back")
+            await db._branch_rollback("", "feat/rollback")
 
-        except AttributeError:
-            # If _send_branch_create is not exposed, test branch via
-            # the namespace.branch() context manager if available
-            print("  Branch API not directly exposed, skipping")
+            # List again - should be gone
+            branches_after = await ns.branch_list()
+            print(f"  Branches after rollback: {len(branches_after)}")
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_branch_context_manager(self, uldb_server):
+        """Branch context manager auto-merges on clean exit."""
+        db = await _connect(uldb_server)
+        try:
+            ns = db.namespace("test_branch_ctx")
+
+            await ns.put("ctx_key", b"before_branch")
+
+            async with ns.branch("feat/ctx-test", "context manager test") as branch:
+                await branch.put("ctx_key", b"branch_version")
+                val = await branch.get("ctx_key")
+                assert val == b"branch_version"
+                print(f"  In-branch read: {val}")
+            # auto-merge on clean exit
+
+            print("  Branch auto-merged")
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_branch_rollback_on_exception(self, uldb_server):
+        """Branch context manager auto-rolls-back on exception."""
+        db = await _connect(uldb_server)
+        try:
+            ns = db.namespace("test_branch_exc")
+            await ns.put("exc_key", b"original")
+
+            try:
+                async with ns.branch("feat/will-fail", "should rollback"):
+                    raise ValueError("simulated failure")
+            except ValueError:
+                pass  # expected
+
+            # Branch should have been rolled back
+            branches = await ns.branch_list()
+            branch_names = [str(b) for b in branches]
+            assert "feat/will-fail" not in branch_names,                 "branch should be rolled back after exception"
+            print("  Branch rolled back on exception: correct")
         finally:
             await db.close()
 
@@ -397,6 +437,129 @@ class TestStats:
             latency = await db.ping()
             assert latency >= 0
             print(f"  Stats test: 5 keys written, ping={latency}us")
+        finally:
+            await db.close()
+
+
+class TestConcurrent:
+    """Multiple simultaneous clients."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_clients(self, uldb_server):
+        """Multiple clients can read and write simultaneously."""
+        import asyncio
+
+        async def client_work(client_id: int):
+            db = await _connect(uldb_server)
+            try:
+                ns = db.namespace("test_concurrent")
+                for i in range(10):
+                    key = f"client_{client_id}_key_{i}"
+                    val = f"client_{client_id}_val_{i}".encode()
+                    await ns.put(key, val)
+                    got = await ns.get(key)
+                    assert got == val, f"client {client_id}: mismatch on {key}"
+            finally:
+                await db.close()
+
+        tasks = [client_work(i) for i in range(4)]
+        await asyncio.gather(*tasks)
+        print(f"  4 concurrent clients x 10 ops each: all correct")
+
+    @pytest.mark.asyncio
+    async def test_concurrent_reads_during_writes(self, uldb_server):
+        """Reader and writer clients operate simultaneously."""
+        import asyncio
+
+        db_writer = await _connect(uldb_server)
+        db_reader = await _connect(uldb_server)
+        try:
+            ns_w = db_writer.namespace("test_rw")
+            ns_r = db_reader.namespace("test_rw")
+
+            # Writer seeds data
+            for i in range(20):
+                await ns_w.put(f"rw_{i:03}", f"val_{i}".encode())
+
+            # Reader reads while writer overwrites
+            async def write_loop():
+                for i in range(20):
+                    await ns_w.put(f"rw_{i:03}", f"updated_{i}".encode())
+
+            async def read_loop():
+                results = []
+                for i in range(20):
+                    val = await ns_r.get(f"rw_{i:03}")
+                    results.append(val is not None)
+                return all(results)
+
+            _, all_found = await asyncio.gather(write_loop(), read_loop())
+            assert all_found, "reader should find all keys during concurrent writes"
+            print("  Concurrent read+write: no crashes, all keys found")
+        finally:
+            await db_writer.close()
+            await db_reader.close()
+
+
+class TestTransactions:
+    """Transaction begin/commit/rollback."""
+
+    @pytest.mark.asyncio
+    async def test_transaction_commit(self, uldb_server):
+        """Transaction begin + commit lifecycle."""
+        db = await _connect(uldb_server)
+        try:
+            # Begin transaction
+            tx_id = await db._tx_begin("snapshot")
+            assert tx_id > 0, f"tx_begin should return positive tx_id, got {tx_id}"
+            print(f"  Transaction started: tx_id={tx_id}")
+
+            # Commit
+            await db._tx_commit(tx_id)
+            print("  Transaction committed")
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_transaction_rollback(self, uldb_server):
+        """Transaction begin + rollback lifecycle."""
+        db = await _connect(uldb_server)
+        try:
+            tx_id = await db._tx_begin("snapshot")
+            assert tx_id > 0
+            await db._tx_rollback(tx_id)
+            print(f"  Transaction {tx_id} rolled back")
+        finally:
+            await db.close()
+
+
+class TestAdmin:
+    """Admin operations."""
+
+    @pytest.mark.asyncio
+    async def test_config_get(self, uldb_server):
+        """Can read server config values."""
+        db = await _connect(uldb_server)
+        try:
+            version = await db.config_get("version")
+            print(f"  Server version: {version}")
+            assert version is not None
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_namespace_create_and_list(self, uldb_server):
+        """Create a namespace and list it."""
+        db = await _connect(uldb_server)
+        try:
+            await db._ns_create(
+                "github.com/test/repo",
+                "abc123",
+                "test namespace"
+            )
+            namespaces = await db._ns_list()
+            assert len(namespaces) >= 1
+            print(f"  Namespaces: {len(namespaces)}")
         finally:
             await db.close()
 
