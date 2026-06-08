@@ -17,7 +17,7 @@
 //   Read concurrency can be improved later with RwLock.
 
 use std::sync::Mutex;
-use crate::namespace::{scope_key, unscope_key, ns_scan_range, derive_namespace_id};
+use crate::namespace::{scope_key, unscope_key, derive_namespace_id};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ulmp::messages::opcode;
@@ -116,6 +116,7 @@ fn result_end_response(total: u32, elapsed_ms: u32) -> Response {
 ///   "42"            -> 42 (raw numeric)
 ///   "repo@sha"      -> fnv1a(repo || "::" || sha)
 ///   "repo::sha"     -> fnv1a(repo || "::" || sha)
+#[allow(dead_code)]
 fn resolve_ns(namespace: &str) -> u64 {
     if namespace.is_empty() {
         return 0;
