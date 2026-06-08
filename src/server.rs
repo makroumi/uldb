@@ -17,6 +17,7 @@
 //   Read concurrency can be improved later with RwLock.
 
 use std::sync::Mutex;
+use crate::namespace::{scope_key, unscope_key, ns_scan_range, derive_namespace_id};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ulmp::messages::opcode;
@@ -107,6 +108,31 @@ fn result_end_response(total: u32, elapsed_ms: u32) -> Response {
     }
 }
 
+
+/// Resolve a namespace string to a numeric namespace ID.
+///
+/// Formats:
+///   ""              -> 0 (global namespace)
+///   "42"            -> 42 (raw numeric)
+///   "repo@sha"      -> fnv1a(repo || "::" || sha)
+///   "repo::sha"     -> fnv1a(repo || "::" || sha)
+fn resolve_ns(namespace: &str) -> u64 {
+    if namespace.is_empty() {
+        return 0;
+    }
+    if let Ok(n) = namespace.parse::<u64>() {
+        return n;
+    }
+    // Try repo@sha format
+    if let Some(pos) = namespace.find('@') {
+        let repo = &namespace[..pos];
+        let sha = &namespace[pos+1..];
+        return derive_namespace_id(repo, sha);
+    }
+    // Fallback: hash the whole string
+    derive_namespace_id(namespace, "")
+}
+
 /// UMP handler backed by the uldb storage engine.
 ///
 /// Tracks active transactions per session.
@@ -131,16 +157,20 @@ impl UmpHandler {
 
 impl Handler for UmpHandler {
     fn handle_put(&self, msg: record::Put) -> Response {
+        let ns_id = 0u64; // namespace scoping applied at workspace level
+        let scoped = scope_key(ns_id, msg.key.as_bytes());
         let mut eng = self.engine.lock().unwrap();
-        match eng.put(msg.key.as_bytes(), &msg.value) {
+        match eng.put(&scoped, &msg.value) {
             Ok(()) => result_end_response(1, 0),
             Err(e) => error_response(0xFF, &format!("put failed: {e}")),
         }
     }
 
     fn handle_get(&self, msg: record::Get) -> Response {
+        let ns_id = 0u64;
+        let scoped = scope_key(ns_id, msg.key.as_bytes());
         let mut eng = self.engine.lock().unwrap();
-        match eng.get(msg.key.as_bytes()) {
+        match eng.get(&scoped) {
             Some(value) => {
                 let payload = enc(vec![
                     string_field(&msg.key),
@@ -162,16 +192,21 @@ impl Handler for UmpHandler {
     }
 
     fn handle_delete(&self, msg: record::Delete) -> Response {
+        let ns_id = 0u64;
+        let scoped = scope_key(ns_id, msg.key.as_bytes());
         let mut eng = self.engine.lock().unwrap();
-        match eng.delete(msg.key.as_bytes()) {
+        match eng.delete(&scoped) {
             Ok(()) => result_end_response(1, 0),
             Err(e) => error_response(0xFF, &format!("delete failed: {e}")),
         }
     }
 
     fn handle_scan(&self, msg: record::Scan) -> Response {
+        let ns_id = 0u64;
+        let scoped_start = scope_key(ns_id, msg.start.as_bytes());
+        let scoped_end = scope_key(ns_id, msg.end.as_bytes());
         let mut eng = self.engine.lock().unwrap();
-        let results = eng.scan(msg.start.as_bytes(), msg.end.as_bytes());
+        let results = eng.scan(&scoped_start, &scoped_end);
         let truncated: Vec<_> = results.into_iter().take(msg.limit as usize).collect();
 
         let mut frames = Vec::new();
@@ -181,11 +216,13 @@ impl Handler for UmpHandler {
         ));
 
         for (i, (key, value)) in truncated.iter().enumerate() {
-            let key_str = String::from_utf8_lossy(key);
+            let display_key = unscope_key(key)
+                .map(|k| String::from_utf8_lossy(k).to_string())
+                .unwrap_or_else(|| String::from_utf8_lossy(key).to_string());
             frames.push((
                 opcode::OP_RESULT_ROW,
                 enc(vec![
-                    string_field(&key_str),
+                    string_field(&display_key),
                     bytes_field(value),
                     u8_field(0),
                     u8_field(0),
@@ -209,11 +246,13 @@ impl Handler for UmpHandler {
     }
 
     fn handle_put_batch(&self, msg: record::PutBatch) -> Response {
+        let ns_id = 0u64;
         let mut eng = self.engine.lock().unwrap();
         let count = msg.records.len();
 
         for (key, value) in msg.records {
-            if let Err(e) = eng.put(key.as_bytes(), &value) {
+            let scoped = scope_key(ns_id, key.as_bytes());
+            if let Err(e) = eng.put(&scoped, &value) {
                 return error_response(0xFF, &format!("batch put failed: {e}"));
             }
         }
@@ -222,9 +261,12 @@ impl Handler for UmpHandler {
     }
 
     fn handle_range_delete(&self, msg: record::RangeDelete) -> Response {
+        let ns_id = 0u64;
+        let scoped_start = scope_key(ns_id, msg.start.as_bytes());
+        let scoped_end = scope_key(ns_id, msg.end.as_bytes());
         let mut eng = self.engine.lock().unwrap();
         let keys: Vec<Vec<u8>> = eng
-            .scan(msg.start.as_bytes(), msg.end.as_bytes())
+            .scan(&scoped_start, &scoped_end)
             .into_iter()
             .map(|(k, _)| k)
             .collect();
@@ -263,9 +305,12 @@ impl Handler for UmpHandler {
             enc(vec![u32_field(hits.len() as u32)]),
         ));
 
+        let ns_id = 0u64;
         for hit in &hits {
             // Look up the actual value from storage.
-            let value = eng.get(&hit.key).unwrap_or_default();
+            // Hit keys from indices are unscoped; scope them for lookup.
+            let scoped_lookup = scope_key(ns_id, &hit.key);
+            let value = eng.get(&scoped_lookup).unwrap_or_default();
             let key_str = String::from_utf8_lossy(&hit.key);
             frames.push((
                 opcode::OP_RESULT_ROW,

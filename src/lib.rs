@@ -15,6 +15,7 @@ pub mod index;
 pub mod tx;
 pub mod query;
 pub mod engine;
+pub mod namespace;
 
 #[cfg(feature = "server")]
 pub mod server;
