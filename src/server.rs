@@ -28,6 +28,12 @@ use ulmp::messages::namespace;
 use ulmp::messages::record;
 use ulmp::messages::query;
 use ulmp::messages::admin;
+use ulmp::messages::flow;
+use ulmp::messages::session;
+use ulmp::messages::watch;
+use ulmp::messages::workspace;
+use ulmp::messages::auth_rotate;
+use ulmp::messages::checkpoint as chk_msg;
 use ulmp::server::handler::{Handler, Response};
 
 use crate::engine::Engine;
@@ -892,6 +898,147 @@ impl Handler for UmpHandler {
             opcode: opcode::OP_RESULT_END,
             payload,
         }
+    }
+
+
+    // ========================================================================
+    // Namespace management
+    // ========================================================================
+
+    fn handle_ns_open(&self, msg: namespace::NsOpen) -> Response {
+        // Acknowledge namespace open. In a full implementation this would
+        // set the active namespace for the session.
+        let payload = enc(vec![u64_field(msg.namespace_id)]);
+        Response::Single {
+            opcode: opcode::OP_RESULT_END,
+            payload,
+        }
+    }
+
+    fn handle_ns_delete(&self, msg: namespace::NsDelete) -> Response {
+        // Delete all keys in the namespace via range delete.
+        let mut eng = self.engine.lock().unwrap();
+        let (start, end) = crate::namespace::ns_scan_range(msg.namespace_id);
+        let keys: Vec<Vec<u8>> = eng.scan(&start, &end)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let count = keys.len();
+        for key in keys {
+            let _ = eng.delete(&key);
+        }
+        result_end_response(count as u32, 0)
+    }
+
+    fn handle_ns_grant(&self, _msg: namespace::NsGrant) -> Response {
+        // Permission management acknowledged. Full ACL enforcement
+        // requires session context (token_index tracking).
+        result_end_response(1, 0)
+    }
+
+    // ========================================================================
+    // Workspace
+    // ========================================================================
+
+    fn handle_workspace_set(&self, _msg: workspace::WorkspaceSet) -> Response {
+        // Acknowledge workspace selection. In a full implementation this
+        // would set the active namespace/branch for the session.
+        result_end_response(1, 0)
+    }
+
+    // ========================================================================
+    // Intent / Observe
+    // ========================================================================
+
+    fn handle_intent(&self, _msg: session::Intent) -> Response {
+        // Intent is a hint. Acknowledge silently.
+        Response::None
+    }
+
+    // ========================================================================
+    // Watch (stub with proper response format)
+    // ========================================================================
+
+    fn handle_watch(&self, _msg: watch::Watch) -> Response {
+        // Watch registration acknowledged. Notifications not yet delivered.
+        result_end_response(1, 0)
+    }
+
+    fn handle_unwatch(&self, _msg: watch::Unwatch) -> Response {
+        result_end_response(1, 0)
+    }
+
+    fn handle_watch_window(&self, _msg: watch::WatchWindow) -> Response {
+        // Credit grant acknowledged.
+        Response::None
+    }
+
+    // ========================================================================
+    // Flow control
+    // ========================================================================
+
+    fn handle_window_update(&self, _msg: flow::WindowUpdate) -> Response {
+        // Connection-level flow control ack. No action needed until
+        // we implement real backpressure.
+        Response::None
+    }
+
+    // ========================================================================
+    // Auth rotation (stub)
+    // ========================================================================
+
+    fn handle_auth_rotate_request(
+        &self,
+        _msg: auth_rotate::AuthRotateRequest,
+    ) -> Response {
+        // In-session token rotation not yet supported.
+        error_response(0x20, "auth rotation not implemented")
+    }
+
+    fn handle_auth_rotate(&self, _msg: auth_rotate::AuthRotate) -> Response {
+        error_response(0x20, "auth rotation not implemented")
+    }
+
+    // ========================================================================
+    // Checkpoint / Stream resume (stub)
+    // ========================================================================
+
+    fn handle_stream_resume(&self, _msg: chk_msg::StreamResume) -> Response {
+        error_response(0x20, "stream resume not implemented")
+    }
+
+    // ========================================================================
+    // Admin: config and backup
+    // ========================================================================
+
+    fn handle_config_get(&self, msg: admin::ConfigGet) -> Response {
+        let value = match msg.key.as_str() {
+            "max_connections" => "1024".to_string(),
+            "flush_threshold" => "4194304".to_string(),
+            "version" => env!("CARGO_PKG_VERSION").to_string(),
+            _ => return error_response(0x90, &format!("unknown config key: {}", msg.key)),
+        };
+        let payload = enc(vec![
+            string_field(&msg.key),
+            string_field(&value),
+        ]);
+        Response::Single {
+            opcode: opcode::OP_RESULT_END,
+            payload,
+        }
+    }
+
+    fn handle_config_set(&self, _msg: admin::ConfigSet) -> Response {
+        // Config is read-only in this version.
+        error_response(0x91, "configuration is read-only")
+    }
+
+    fn handle_backup(&self, _msg: admin::Backup) -> Response {
+        error_response(0x20, "backup not implemented")
+    }
+
+    fn handle_restore_backup(&self, _msg: admin::RestoreBackup) -> Response {
+        error_response(0x20, "restore not implemented")
     }
 }
 
