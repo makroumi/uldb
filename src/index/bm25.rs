@@ -118,24 +118,30 @@ impl Bm25Index {
         self.key_to_doc.insert(key.clone(), doc_id);
         self.docs.push(key);
 
-        let tokens = tokenize(content);
+        let mut tokens = tokenize(content);
         let len = tokens.len() as u32;
         self.doc_len.push(len);
 
-        // term frequencies: reuse tokens Vec, count in-place
-        let mut tf: HashMap<String, u32> = HashMap::with_capacity(tokens.len());
-        for tok in tokens {
-            *tf.entry(tok).or_insert(0) += 1;
-        }
+        // Sort tokens so identical terms are adjacent.
+        // Count term frequency by scanning runs. Avoids HashMap allocation.
+        tokens.sort_unstable();
 
-        // Store terms and update postings in a single pass (no extra clone)
-        let mut terms = Vec::with_capacity(tf.len());
-        for (term, freq) in tf {
+        let mut terms = Vec::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            let term = &tokens[i];
+            let mut freq = 1u32;
+            while i + (freq as usize) < tokens.len() && &tokens[i + freq as usize] == term {
+                freq += 1;
+            }
+
             self.postings.entry(term.clone())
                 .or_default()
                 .push((doc_id, freq));
             *self.df.entry(term.clone()).or_insert(0) += 1;
-            terms.push(term);
+            terms.push(std::mem::take(&mut tokens[i]));
+
+            i += freq as usize;
         }
         self.doc_terms.push(terms);
 
@@ -265,46 +271,41 @@ impl Bm25Index {
 /// Example:
 ///   "getUserById and validate_token" -> ["get", "user", "by", "id", "and", "validate", "token"]
 fn tokenize(text: &str) -> Vec<String> {
-    // Fast tokenizer: processes bytes directly, avoids intermediate
-    // String allocation for camelCase expansion.
+    // Fast tokenizer: lowercases in-place into a reusable buffer,
+    // then splits on non-alnum boundaries with camelCase detection.
     let bytes = text.as_bytes();
-    let mut tokens = Vec::new();
-    let mut start = 0;
+    let mut tokens = Vec::with_capacity(16);
+    let mut buf = Vec::with_capacity(32);
     let mut in_token = false;
 
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
 
-        // Check for camelCase boundary: lowercase followed by uppercase
-        if i > 0 && b.is_ascii_uppercase() && bytes[i - 1].is_ascii_lowercase() && in_token {
-            // Emit the token before the uppercase letter
-            if start < i {
-                let tok = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
-                tokens.push(tok.to_ascii_lowercase());
+        // camelCase boundary: emit current token, start new one
+        if b.is_ascii_uppercase() && in_token && i > 0 && bytes[i - 1].is_ascii_lowercase() {
+            if !buf.is_empty() {
+                // SAFETY: buf contains only ASCII lowercase bytes
+                tokens.push(unsafe { String::from_utf8_unchecked(buf.clone()) });
+                buf.clear();
             }
-            start = i;
         }
 
         if b.is_ascii_alphanumeric() {
-            if !in_token {
-                start = i;
-                in_token = true;
+            buf.push(b.to_ascii_lowercase());
+            in_token = true;
+        } else if in_token {
+            if !buf.is_empty() {
+                tokens.push(unsafe { String::from_utf8_unchecked(buf.clone()) });
+                buf.clear();
             }
-        } else {
-            if in_token {
-                let tok = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
-                tokens.push(tok.to_ascii_lowercase());
-                in_token = false;
-            }
+            in_token = false;
         }
         i += 1;
     }
 
-    // Emit last token
-    if in_token && start < bytes.len() {
-        let tok = unsafe { std::str::from_utf8_unchecked(&bytes[start..]) };
-        tokens.push(tok.to_ascii_lowercase());
+    if !buf.is_empty() {
+        tokens.push(unsafe { String::from_utf8_unchecked(buf) });
     }
 
     tokens
