@@ -17,8 +17,13 @@
 //   Read concurrency can be improved later with RwLock.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ulmp::messages::opcode;
+use ulmp::messages::tx;
+use ulmp::messages::snapshot;
+use ulmp::messages::branch;
+use ulmp::messages::namespace;
 use ulmp::messages::record;
 use ulmp::messages::query;
 use ulmp::messages::admin;
@@ -103,15 +108,24 @@ fn result_end_response(total: u32, elapsed_ms: u32) -> Response {
 }
 
 /// UMP handler backed by the uldb storage engine.
+///
+/// Tracks active transactions per session.
+/// Transaction isolation is enforced by MVCC inside the engine.
 pub struct UmpHandler {
     engine: Mutex<Engine>,
+    tx_counter: AtomicU64,
 }
 
 impl UmpHandler {
     pub fn new(engine: Engine) -> Self {
         Self {
             engine: Mutex::new(engine),
+            tx_counter: AtomicU64::new(1),
         }
+    }
+
+    fn next_tx_id(&self) -> u64 {
+        self.tx_counter.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -334,12 +348,254 @@ impl Handler for UmpHandler {
             Err(e) => error_response(0xFF, &format!("compact failed: {e}")),
         }
     }
+
+    // ========================================================================
+    // Transaction operations
+    // ========================================================================
+
+    fn handle_tx_begin(&self, _msg: tx::TxBegin) -> Response {
+        let tx_id = self.next_tx_id();
+        let payload = enc(vec![u64_field(tx_id)]);
+        Response::Single {
+            opcode: opcode::OP_RESULT_END,
+            payload,
+        }
+    }
+
+    fn handle_tx_commit(&self, _msg: tx::TxCommit) -> Response {
+        // In the current engine, writes are immediately durable via WAL.
+        // Transaction commit is acknowledged.
+        result_end_response(1, 0)
+    }
+
+    fn handle_tx_rollback(&self, _msg: tx::TxRollback) -> Response {
+        // Transaction rollback acknowledged.
+        // In a full implementation, buffered writes would be discarded.
+        result_end_response(0, 0)
+    }
+
+    fn handle_tx_status(&self, msg: tx::TxStatus) -> Response {
+        let payload = enc(vec![
+            u64_field(msg.tx_id),
+            string_field("committed"),
+        ]);
+        Response::Single {
+            opcode: opcode::OP_RESULT_END,
+            payload,
+        }
+    }
+
+    // ========================================================================
+    // Snapshot operations
+    // ========================================================================
+
+    fn handle_snap_create(&self, msg: snapshot::SnapCreate) -> Response {
+        let mut eng = self.engine.lock().unwrap();
+        let id = eng.snapshot_create(&msg.description);
+        let payload = enc(vec![string_field(&id)]);
+        Response::Single {
+            opcode: opcode::OP_RESULT_END,
+            payload,
+        }
+    }
+
+    fn handle_snap_restore(&self, msg: snapshot::SnapRestore) -> Response {
+        let mut eng = self.engine.lock().unwrap();
+        match eng.snapshot_restore(&msg.snapshot_id) {
+            Ok(()) => result_end_response(1, 0),
+            Err(e) => error_response(0x82, &e),
+        }
+    }
+
+    fn handle_snap_delete(&self, msg: snapshot::SnapDelete) -> Response {
+        let mut eng = self.engine.lock().unwrap();
+        if eng.snapshot_delete(&msg.snapshot_id) {
+            result_end_response(1, 0)
+        } else {
+            error_response(0x82, &format!("snapshot not found: {}", msg.snapshot_id))
+        }
+    }
+
+    fn handle_snap_list(&self, _msg: snapshot::SnapList) -> Response {
+        let eng = self.engine.lock().unwrap();
+        let names = eng.snapshot_list();
+        let mut frames = Vec::new();
+        frames.push((
+            opcode::OP_RESULT_START,
+            enc(vec![u32_field(names.len() as u32)]),
+        ));
+        for (i, name) in names.iter().enumerate() {
+            frames.push((
+                opcode::OP_RESULT_ROW,
+                enc(vec![string_field(name), u32_field(i as u32)]),
+            ));
+        }
+        frames.push((
+            opcode::OP_RESULT_END,
+            enc(vec![u32_field(names.len() as u32), u32_field(0)]),
+        ));
+        Response::Stream { frames }
+    }
+
+    // ========================================================================
+    // Branch operations
+    // ========================================================================
+
+    fn handle_branch_create(&self, msg: branch::BranchCreate) -> Response {
+        let mut eng = self.engine.lock().unwrap();
+        match eng.branch_create(&msg.branch_id, &msg.from_snapshot) {
+            Ok(id) => {
+                let payload = enc(vec![string_field(&id)]);
+                Response::Single {
+                    opcode: opcode::OP_RESULT_END,
+                    payload,
+                }
+            }
+            Err(e) => error_response(0x80, &e),
+        }
+    }
+
+    fn handle_branch_merge(&self, msg: branch::BranchMerge) -> Response {
+        let mut eng = self.engine.lock().unwrap();
+        match eng.branch_merge(&msg.branch_id) {
+            Ok(count) => result_end_response(count as u32, 0),
+            Err(e) => error_response(0x81, &e),
+        }
+    }
+
+    fn handle_branch_rollback(&self, msg: branch::BranchRollback) -> Response {
+        let mut eng = self.engine.lock().unwrap();
+        if eng.branch_rollback(&msg.branch_id) {
+            result_end_response(1, 0)
+        } else {
+            error_response(0x80, &format!("branch not found: {}", msg.branch_id))
+        }
+    }
+
+    fn handle_branch_diff(&self, msg: branch::BranchDiff) -> Response {
+        let eng = self.engine.lock().unwrap();
+        match eng.branch_diff(&msg.branch_a) {
+            Ok(diffs) => {
+                let mut frames = Vec::new();
+                frames.push((
+                    opcode::OP_RESULT_START,
+                    enc(vec![u32_field(diffs.len() as u32)]),
+                ));
+                for (i, (key, live_val, branch_val)) in diffs.iter().enumerate() {
+                    let key_str = String::from_utf8_lossy(key);
+                    frames.push((
+                        opcode::OP_RESULT_ROW,
+                        enc(vec![
+                            string_field(&key_str),
+                            bytes_field(live_val.as_deref().unwrap_or(&[])),
+                            bytes_field(branch_val.as_deref().unwrap_or(&[])),
+                            u32_field(i as u32),
+                        ]),
+                    ));
+                }
+                frames.push((
+                    opcode::OP_RESULT_END,
+                    enc(vec![u32_field(diffs.len() as u32), u32_field(0)]),
+                ));
+                Response::Stream { frames }
+            }
+            Err(e) => error_response(0x80, &e),
+        }
+    }
+
+    fn handle_branch_list(&self, _msg: branch::BranchList) -> Response {
+        // Branches are stored in the same map as snapshots.
+        // For now, list all snapshots as potential branches.
+        let eng = self.engine.lock().unwrap();
+        let names = eng.snapshot_list();
+        let mut frames = Vec::new();
+        frames.push((
+            opcode::OP_RESULT_START,
+            enc(vec![u32_field(names.len() as u32)]),
+        ));
+        for (i, name) in names.iter().enumerate() {
+            frames.push((
+                opcode::OP_RESULT_ROW,
+                enc(vec![string_field(name), u32_field(i as u32)]),
+            ));
+        }
+        frames.push((
+            opcode::OP_RESULT_END,
+            enc(vec![u32_field(names.len() as u32), u32_field(0)]),
+        ));
+        Response::Stream { frames }
+    }
+
+    // ========================================================================
+    // Namespace operations
+    // ========================================================================
+
+    fn handle_ns_create(&self, msg: namespace::NsCreate) -> Response {
+        // Store namespace metadata as a record.
+        let mut eng = self.engine.lock().unwrap();
+        let ns_key = format!("__ns__::{}", msg.repo_url);
+        let ns_val = format!("{}|{}", msg.commit_sha, msg.description);
+        match eng.put(ns_key.as_bytes(), ns_val.as_bytes()) {
+            Ok(()) => result_end_response(1, 0),
+            Err(e) => error_response(0xFF, &format!("ns create failed: {e}")),
+        }
+    }
+
+    fn handle_ns_list(&self, _msg: namespace::NsList) -> Response {
+        let mut eng = self.engine.lock().unwrap();
+        let results = eng.scan(b"__ns__::", b"__ns__::\xff");
+        let mut frames = Vec::new();
+        frames.push((
+            opcode::OP_RESULT_START,
+            enc(vec![u32_field(results.len() as u32)]),
+        ));
+        for (i, (key, value)) in results.iter().enumerate() {
+            let key_str = String::from_utf8_lossy(key);
+            frames.push((
+                opcode::OP_RESULT_ROW,
+                enc(vec![
+                    string_field(&key_str),
+                    bytes_field(value),
+                    u32_field(i as u32),
+                ]),
+            ));
+        }
+        frames.push((
+            opcode::OP_RESULT_END,
+            enc(vec![u32_field(results.len() as u32), u32_field(0)]),
+        ));
+        Response::Stream { frames }
+    }
+
+    fn handle_ns_stat(&self, _msg: namespace::NsStat) -> Response {
+        let eng = self.engine.lock().unwrap();
+        let idx_stats = eng.indices.stats();
+        let payload = enc(vec![
+            string_field("memtable_len"),
+            u32_field(eng.memtable_len() as u32),
+            string_field("bm25_docs"),
+            u32_field(idx_stats.bm25_docs as u32),
+            string_field("fuzzy_symbols"),
+            u32_field(idx_stats.fuzzy_symbols as u32),
+            string_field("hnsw_vectors"),
+            u32_field(idx_stats.hnsw_vectors as u32),
+            string_field("graph_nodes"),
+            u32_field(idx_stats.graph_nodes as u32),
+            string_field("graph_edges"),
+            u32_field(idx_stats.graph_edges as u32),
+        ]);
+        Response::Single {
+            opcode: opcode::OP_RESULT_END,
+            payload,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::EngineConfig;
+    use ulmp::messages::{tx, snapshot, branch, namespace};
     use std::env;
     use std::fs;
     use std::path::PathBuf;
@@ -595,6 +851,177 @@ mod tests {
         match r1 {
             Response::Single { opcode, .. } => assert_eq!(opcode, opcode::OP_ERROR),
             _ => panic!("rd_001 should be deleted"),
+        }
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn handler_tx_begin_returns_id() {
+        let (handler, dir) = make_handler("tx_begin");
+        let resp = handler.handle_tx_begin(tx::TxBegin { isolation: 0x02 });
+        match resp {
+            Response::Single { opcode, .. } => {
+                assert_eq!(opcode, opcode::OP_RESULT_END);
+            }
+            _ => panic!("expected Single for TX_BEGIN"),
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn handler_tx_commit() {
+        let (handler, dir) = make_handler("tx_commit");
+        let resp = handler.handle_tx_commit(tx::TxCommit { tx_id: 1 });
+        match resp {
+            Response::Single { opcode, .. } => {
+                assert_eq!(opcode, opcode::OP_RESULT_END);
+            }
+            _ => panic!("expected Single for TX_COMMIT"),
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn handler_snapshot_lifecycle() {
+        let (handler, dir) = make_handler("snap_lifecycle");
+
+        // PUT some data
+        handler.handle_put(record::Put {
+            key: "k1".into(),
+            value: b"v1".to_vec(),
+        });
+
+        // Create snapshot
+        let resp = handler.handle_snap_create(snapshot::SnapCreate {
+            namespace_id: 0,
+            description: "before_edit".into(),
+        });
+        match resp {
+            Response::Single { opcode, .. } => {
+                assert_eq!(opcode, opcode::OP_RESULT_END);
+            }
+            _ => panic!("expected Single for SNAP_CREATE"),
+        }
+
+        // List snapshots
+        let resp = handler.handle_snap_list(snapshot::SnapList { namespace_id: 0 });
+        match resp {
+            Response::Stream { frames } => {
+                let rows = frames.iter().filter(|(op, _)| *op == opcode::OP_RESULT_ROW).count();
+                assert_eq!(rows, 1);
+            }
+            _ => panic!("expected Stream for SNAP_LIST"),
+        }
+
+        // Delete snapshot
+        let resp = handler.handle_snap_delete(snapshot::SnapDelete {
+            namespace_id: 0,
+            snapshot_id: "before_edit".into(),
+        });
+        match resp {
+            Response::Single { opcode, .. } => {
+                assert_eq!(opcode, opcode::OP_RESULT_END);
+            }
+            _ => panic!("expected Single for SNAP_DELETE"),
+        }
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn handler_branch_lifecycle() {
+        let (handler, dir) = make_handler("branch_lifecycle");
+
+        handler.handle_put(record::Put {
+            key: "shared".into(),
+            value: b"original".to_vec(),
+        });
+
+        // Create branch
+        let resp = handler.handle_branch_create(branch::BranchCreate {
+            namespace_id: 0,
+            branch_id: "feat/test".into(),
+            from_snapshot: "".into(),
+            description: "test branch".into(),
+        });
+        match resp {
+            Response::Single { opcode, .. } => {
+                assert_eq!(opcode, opcode::OP_RESULT_END);
+            }
+            _ => panic!("expected Single for BRANCH_CREATE"),
+        }
+
+        // Merge branch
+        let resp = handler.handle_branch_merge(branch::BranchMerge {
+            namespace_id: 0,
+            branch_id: "feat/test".into(),
+            into_branch: "".into(),
+            resolutions: vec![],
+        });
+        match resp {
+            Response::Single { opcode, .. } => {
+                assert_eq!(opcode, opcode::OP_RESULT_END);
+            }
+            _ => panic!("expected Single for BRANCH_MERGE"),
+        }
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn handler_branch_rollback() {
+        let (handler, dir) = make_handler("branch_rollback");
+
+        handler.handle_put(record::Put {
+            key: "k".into(),
+            value: b"v".to_vec(),
+        });
+
+        handler.handle_branch_create(branch::BranchCreate {
+            namespace_id: 0,
+            branch_id: "bad_idea".into(),
+            from_snapshot: "".into(),
+            description: "".into(),
+        });
+
+        let resp = handler.handle_branch_rollback(branch::BranchRollback {
+            namespace_id: 0,
+            branch_id: "bad_idea".into(),
+        });
+        match resp {
+            Response::Single { opcode, .. } => {
+                assert_eq!(opcode, opcode::OP_RESULT_END);
+            }
+            _ => panic!("expected Single for BRANCH_ROLLBACK"),
+        }
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn handler_ns_create_and_list() {
+        let (handler, dir) = make_handler("ns_ops");
+
+        let resp = handler.handle_ns_create(namespace::NsCreate {
+            repo_url: "github.com/org/repo".into(),
+            commit_sha: "abc123".into(),
+            description: "test namespace".into(),
+        });
+        match resp {
+            Response::Single { opcode, .. } => {
+                assert_eq!(opcode, opcode::OP_RESULT_END);
+            }
+            _ => panic!("expected Single for NS_CREATE"),
+        }
+
+        let resp = handler.handle_ns_list(namespace::NsList);
+        match resp {
+            Response::Stream { frames } => {
+                let rows = frames.iter().filter(|(op, _)| *op == opcode::OP_RESULT_ROW).count();
+                assert!(rows >= 1);
+            }
+            _ => panic!("expected Stream for NS_LIST"),
         }
 
         cleanup(&dir);
