@@ -348,6 +348,128 @@ impl RelationGraph {
         results
     }
 
+    // =========================================================================
+    // Persistence
+    // =========================================================================
+
+    /// Serialize the graph to bytes.
+    ///
+    /// Format:
+    ///   [4B magic "GRPH"]
+    ///   [4B n_nodes]
+    ///   per node: [4B key_len][key UTF-8 bytes]
+    ///   [4B n_edges]
+    ///   per edge: [4B src_idx][4B dst_idx][1B relation_tag]
+    ///
+    /// On load, nodes and edges are replayed via add_node/add_edge
+    /// which rebuilds key_to_idx, bwd_adj, and CSR arrays.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+
+        // Magic
+        out.extend_from_slice(b"GRPH");
+
+        // Nodes
+        out.extend_from_slice(&(self.idx_to_key.len() as u32).to_be_bytes());
+        for key in &self.idx_to_key {
+            let kb = key.as_bytes();
+            out.extend_from_slice(&(kb.len() as u32).to_be_bytes());
+            out.extend_from_slice(kb);
+        }
+
+        // Forward edges
+        out.extend_from_slice(&(self.edge_count as u32).to_be_bytes());
+        for (src_idx, edges) in self.fwd_adj.iter().enumerate() {
+            for edge in edges {
+                out.extend_from_slice(&(src_idx as u32).to_be_bytes());
+                out.extend_from_slice(&(edge.dst as u32).to_be_bytes());
+                out.push(match edge.relation {
+                    Relation::Imports => 0x01,
+                    Relation::Calls => 0x02,
+                    Relation::Inherits => 0x03,
+                    Relation::Tests => 0x04,
+                    Relation::Defines => 0x05,
+                });
+            }
+        }
+
+        out
+    }
+
+    /// Deserialize a graph from bytes.
+    ///
+    /// Replays add_node and add_edge calls to reconstruct the full
+    /// graph including backward adjacency and CSR arrays.
+    pub fn deserialize(data: &[u8]) -> Result<Self, String> {
+        let mut pos: usize;
+
+        let read_u32 = |data: &[u8], pos: &mut usize| -> Result<u32, String> {
+            if *pos + 4 > data.len() {
+                return Err("unexpected EOF reading u32".into());
+            }
+            let v = u32::from_be_bytes([
+                data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3],
+            ]);
+            *pos += 4;
+            Ok(v)
+        };
+
+        // Magic
+        if data.len() < 4 || &data[0..4] != b"GRPH" {
+            return Err("bad GRPH magic".into());
+        }
+        pos = 4;
+
+        // Nodes
+        let n_nodes = read_u32(data, &mut pos)? as usize;
+        let mut node_keys = Vec::with_capacity(n_nodes);
+        for _ in 0..n_nodes {
+            let key_len = read_u32(data, &mut pos)? as usize;
+            if pos + key_len > data.len() {
+                return Err("unexpected EOF reading node key".into());
+            }
+            let key = std::str::from_utf8(&data[pos..pos + key_len])
+                .map_err(|_| "invalid UTF-8 in node key".to_string())?
+                .to_string();
+            pos += key_len;
+            node_keys.push(key);
+        }
+
+        // Edges
+        let n_edges = read_u32(data, &mut pos)? as usize;
+        let mut edges = Vec::with_capacity(n_edges);
+        for _ in 0..n_edges {
+            let src = read_u32(data, &mut pos)? as usize;
+            let dst = read_u32(data, &mut pos)? as usize;
+            if pos >= data.len() {
+                return Err("unexpected EOF reading relation tag".into());
+            }
+            let rel = match data[pos] {
+                0x01 => Relation::Imports,
+                0x02 => Relation::Calls,
+                0x03 => Relation::Inherits,
+                0x04 => Relation::Tests,
+                0x05 => Relation::Defines,
+                other => return Err(format!("unknown relation tag: {other:#x}")),
+            };
+            pos += 1;
+            edges.push((src, dst, rel));
+        }
+
+        // Rebuild graph via public API
+        let mut graph = RelationGraph::new();
+        for key in &node_keys {
+            graph.add_node(key);
+        }
+        for (src, dst, rel) in edges {
+            if src < node_keys.len() && dst < node_keys.len() {
+                graph.add_edge(&node_keys[src], &node_keys[dst], rel);
+            }
+        }
+
+        Ok(graph)
+    }
+
     pub fn node_count(&self) -> usize { self.idx_to_key.len() }
     pub fn edge_count(&self) -> usize { self.edge_count }
     pub fn is_built(&self) -> bool { self.built }

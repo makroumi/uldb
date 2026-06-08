@@ -56,6 +56,12 @@ const DEFAULT_FLUSH_THRESHOLD: usize = 4 * 1024 * 1024;
 /// WAL file name within the data directory.
 const WAL_FILENAME: &str = "wal.log";
 
+/// HNSW index file name within the data directory.
+const HNSW_FILENAME: &str = "hnsw.bin";
+
+/// Graph index file name within the data directory.
+const GRAPH_FILENAME: &str = "graph.bin";
+
 /// Engine configuration.
 pub struct EngineConfig {
     /// Data directory path. Created if it does not exist.
@@ -109,8 +115,47 @@ impl Engine {
 
         // Replay existing WAL if present.
         let mut memtable = Memtable::new(config.flush_threshold);
-        let compactor = BackgroundCompactor::new();
+        let compactor = BackgroundCompactor::new(Some(config.data_dir.clone()));
         let mut indices = IndexManager::new();
+
+        // Load persisted pages from disk into compaction levels.
+        {
+            let page_store = crate::storage::page_store::PageStore::new(&config.data_dir)?;
+            let loaded_pages = page_store.load_all()?;
+            let c = compactor.state();
+            let mut cm = c.lock().unwrap();
+            for (level, pages) in loaded_pages.into_iter().enumerate() {
+                cm.load_pages(level, pages);
+            }
+        }
+
+        // Load persisted HNSW index from disk.
+        let hnsw_path = config.data_dir.join(HNSW_FILENAME);
+        if hnsw_path.exists() {
+            match fs::read(&hnsw_path) {
+                Ok(data) => match crate::index::hnsw::HnswIndex::deserialize(&data) {
+                    Ok(hnsw) => {
+                        indices.hnsw = Some(hnsw);
+                    }
+                    Err(e) => eprintln!("[uldb] failed to load HNSW index: {e}"),
+                },
+                Err(e) => eprintln!("[uldb] failed to read HNSW file: {e}"),
+            }
+        }
+
+        // Load persisted graph index from disk.
+        let graph_path = config.data_dir.join(GRAPH_FILENAME);
+        if graph_path.exists() {
+            match fs::read(&graph_path) {
+                Ok(data) => match crate::index::graph::RelationGraph::deserialize(&data) {
+                    Ok(graph) => {
+                        indices.graph = graph;
+                    }
+                    Err(e) => eprintln!("[uldb] failed to load graph index: {e}"),
+                },
+                Err(e) => eprintln!("[uldb] failed to read graph file: {e}"),
+            }
+        }
 
         if wal_path.exists() {
             let reader = WalReader::open(&wal_path)?;
@@ -250,20 +295,20 @@ impl Engine {
     /// Merges results from memtable and compaction levels.
     /// Memtable entries take precedence over page entries.
     pub fn scan(&mut self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut results: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
-            std::collections::BTreeMap::new();
+        // Collect from compaction levels first (oldest data).
+        let mut results = {
+            let state = self.compactor.state();
+            let c = state.lock().unwrap();
+            c.scan(start, end)
+        };
 
-        // First: collect from compaction levels.
-        // CompactionManager does not have a range scan, so we scan pages directly.
-        // For now, we only scan the memtable. This will be extended when
-        // compaction gets a range scan API.
-
-        // Memtable range scan (takes precedence).
+        // Memtable entries are newer than compacted pages and therefore
+        // take precedence over them.
         for (key, entry) in self.memtable.range(start, end) {
             if let Some(value) = &entry.value {
                 results.insert(key.to_vec(), value.clone());
             } else {
-                // Tombstone: remove from results if compaction had it.
+                // Memtable tombstone removes any older compacted value.
                 results.remove(key);
             }
         }
@@ -293,6 +338,25 @@ impl Engine {
     pub fn close(mut self) -> io::Result<()> {
         self.flush()?;
         self.wal.sync()?;
+
+        // Persist HNSW index to disk.
+        if let Some(ref hnsw) = self.indices.hnsw {
+            let hnsw_path = self.data_dir.join(HNSW_FILENAME);
+            let data = hnsw.serialize();
+            if let Err(e) = fs::write(&hnsw_path, &data) {
+                eprintln!("[uldb] failed to write HNSW index: {e}");
+            }
+        }
+
+        // Persist graph index to disk.
+        let graph_data = self.indices.graph.serialize();
+        if !graph_data.is_empty() && self.indices.graph.node_count() > 0 {
+            let graph_path = self.data_dir.join(GRAPH_FILENAME);
+            if let Err(e) = fs::write(&graph_path, &graph_data) {
+                eprintln!("[uldb] failed to write graph index: {e}");
+            }
+        }
+
         self.compactor.shutdown();
         Ok(())
     }

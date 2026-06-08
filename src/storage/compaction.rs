@@ -151,6 +151,37 @@ impl CompactionManager {
         None
     }
 
+    /// Range scan across all compaction levels over the half-open interval
+    /// [start, end).
+    ///
+    /// Merge order is oldest -> newest so later entries overwrite earlier ones:
+    ///   L2 (oldest) -> L1 -> L0 (newest)
+    ///
+    /// Within L0, pages are stored in flush order, so later pages are newer.
+    /// Tombstones remove older values from the merged result.
+    pub fn scan(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+        let mut merged = std::collections::BTreeMap::new();
+
+        // Oldest to newest: L2 -> L1 -> L0
+        for level in (0..=2).rev() {
+            for page in &self.levels[level] {
+                for rec in page.range(start, end) {
+                    if rec.tombstone {
+                        merged.remove(rec.key.as_slice());
+                    } else {
+                        merged.insert(rec.key.clone(), rec.value.clone());
+                    }
+                }
+            }
+        }
+
+        merged
+    }
+
     pub fn compaction_count(&self) -> u64 {
         self.compaction_count
     }
@@ -161,6 +192,18 @@ impl CompactionManager {
             self.levels[1].len(),
             self.levels[2].len(),
         ]
+    }
+
+    /// Access all pages for persistence. Used by PageStore::save_all().
+    pub fn all_pages(&self) -> &[Vec<Page>; 3] {
+        &self.levels
+    }
+
+    /// Load pages from disk into a specific level. Used on startup.
+    pub fn load_pages(&mut self, level: usize, pages: Vec<Page>) {
+        if level <= 2 {
+            self.levels[level] = pages;
+        }
     }
 
     pub fn total_records(&self) -> usize {

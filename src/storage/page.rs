@@ -155,6 +155,24 @@ impl Page {
             })
     }
 
+    /// Range scan within this page over the half-open interval [start, end).
+    ///
+    /// Records are sorted by key, so we binary-search to the first candidate
+    /// and then iterate until we reach `end`.
+    pub fn range<'a>(
+        &'a self,
+        start: &'a [u8],
+        end: &'a [u8],
+    ) -> impl Iterator<Item = &'a PageRecord> + 'a {
+        let first = self.records
+            .binary_search_by(|r| r.key.as_slice().cmp(start))
+            .unwrap_or_else(|idx| idx);
+
+        self.records[first..]
+            .iter()
+            .take_while(move |rec| rec.key.as_slice() < end)
+    }
+
     pub fn len(&self) -> usize { self.records.len() }
     pub fn is_empty(&self) -> bool { self.records.is_empty() }
     pub fn tombstone_count(&self) -> usize {

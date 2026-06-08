@@ -457,6 +457,177 @@ impl HnswIndex {
         cands.sort_by(|a, b| a.0.cmp(&b.0));
         self.select_neighbours_heuristic(node, &cands, m_max)
     }
+
+    // =========================================================================
+    // Persistence
+    // =========================================================================
+
+    /// Serialize the entire HNSW index to bytes.
+    ///
+    /// Format:
+    ///   [4B magic "HNSW"]
+    ///   [4B dim][4B m][4B ef_build][4B ef_search]
+    ///   [4B n_nodes]
+    ///   per node:
+    ///     [4B key_len][key bytes]
+    ///     [dim * 4B f32 vector]
+    ///     [1B n_layers]
+    ///     per layer: [4B n_neighbours][n_neighbours * 4B idx]
+    ///   [1B has_entry_point]
+    ///   [4B entry_point_idx] (if has_entry_point)
+    ///   [4B entry_level]
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+
+        // Magic
+        out.extend_from_slice(b"HNSW");
+
+        // Config
+        out.extend_from_slice(&(self.dim as u32).to_be_bytes());
+        out.extend_from_slice(&(self.m as u32).to_be_bytes());
+        out.extend_from_slice(&(self.ef_build as u32).to_be_bytes());
+        out.extend_from_slice(&(self.ef_search as u32).to_be_bytes());
+
+        // Nodes
+        out.extend_from_slice(&(self.nodes.len() as u32).to_be_bytes());
+        for node in &self.nodes {
+            // Key
+            out.extend_from_slice(&(node.key.len() as u32).to_be_bytes());
+            out.extend_from_slice(&node.key);
+
+            // Vector (already normalized)
+            for &v in &node.vector {
+                out.extend_from_slice(&v.to_bits().to_be_bytes());
+            }
+
+            // Neighbours
+            out.push(node.neighbours.len() as u8);
+            for layer in &node.neighbours {
+                out.extend_from_slice(&(layer.len() as u32).to_be_bytes());
+                for &idx in layer {
+                    out.extend_from_slice(&(idx as u32).to_be_bytes());
+                }
+            }
+        }
+
+        // Entry point
+        match self.entry_point {
+            Some(ep) => {
+                out.push(1);
+                out.extend_from_slice(&(ep as u32).to_be_bytes());
+            }
+            None => {
+                out.push(0);
+            }
+        }
+
+        // Entry level
+        out.extend_from_slice(&(self.entry_level as u32).to_be_bytes());
+
+        out
+    }
+
+    /// Deserialize an HNSW index from bytes.
+    pub fn deserialize(data: &[u8]) -> Result<Self, String> {
+        let mut pos: usize;
+
+        let read_u32 = |data: &[u8], pos: &mut usize| -> Result<u32, String> {
+            if *pos + 4 > data.len() {
+                return Err("unexpected EOF reading u32".into());
+            }
+            let v = u32::from_be_bytes([
+                data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3],
+            ]);
+            *pos += 4;
+            Ok(v)
+        };
+
+        let read_u8 = |data: &[u8], pos: &mut usize| -> Result<u8, String> {
+            if *pos >= data.len() {
+                return Err("unexpected EOF reading u8".into());
+            }
+            let v = data[*pos];
+            *pos += 1;
+            Ok(v)
+        };
+
+        // Magic
+        if data.len() < 4 || &data[0..4] != b"HNSW" {
+            return Err("bad HNSW magic".into());
+        }
+        pos = 4;
+
+        // Config
+        let dim = read_u32(data, &mut pos)? as usize;
+        let m = read_u32(data, &mut pos)? as usize;
+        let ef_build = read_u32(data, &mut pos)? as usize;
+        let ef_search = read_u32(data, &mut pos)? as usize;
+
+        // Nodes
+        let n_nodes = read_u32(data, &mut pos)? as usize;
+        let mut nodes = Vec::with_capacity(n_nodes);
+
+        for _ in 0..n_nodes {
+            // Key
+            let key_len = read_u32(data, &mut pos)? as usize;
+            if pos + key_len > data.len() {
+                return Err("unexpected EOF reading key".into());
+            }
+            let key = data[pos..pos + key_len].to_vec();
+            pos += key_len;
+
+            // Vector
+            if pos + dim * 4 > data.len() {
+                return Err("unexpected EOF reading vector".into());
+            }
+            let mut vector = Vec::with_capacity(dim);
+            for _ in 0..dim {
+                let bits = u32::from_be_bytes([
+                    data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
+                ]);
+                vector.push(f32::from_bits(bits));
+                pos += 4;
+            }
+
+            // Neighbours
+            let n_layers = read_u8(data, &mut pos)? as usize;
+            let mut neighbours = Vec::with_capacity(n_layers);
+            for _ in 0..n_layers {
+                let n_nb = read_u32(data, &mut pos)? as usize;
+                let mut layer = Vec::with_capacity(n_nb);
+                for _ in 0..n_nb {
+                    layer.push(read_u32(data, &mut pos)? as usize);
+                }
+                neighbours.push(layer);
+            }
+
+            nodes.push(Node { vector, key, neighbours });
+        }
+
+        // Entry point
+        let has_ep = read_u8(data, &mut pos)?;
+        let entry_point = if has_ep == 1 {
+            Some(read_u32(data, &mut pos)? as usize)
+        } else {
+            None
+        };
+
+        // Entry level
+        let entry_level = read_u32(data, &mut pos)? as usize;
+
+        Ok(Self {
+            dim,
+            m,
+            m0: m * 2,
+            ef_build,
+            ef_search,
+            nodes,
+            entry_point,
+            entry_level,
+            rng: Rng::new(42),
+        })
+    }
+
 }
 
 #[cfg(test)]

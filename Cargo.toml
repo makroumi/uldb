@@ -34,3 +34,13 @@ lto = true
 codegen-units = 1
 opt-level = 3
 strip = true
+
+[[test]]
+name = "e2e_gaps"
+path = "tests/rust/e2e_gaps.rs"
+required-features = ["server"]
+
+[[test]]
+name = "scan_read_through"
+path = "tests/rust/scan_read_through.rs"
+required-features = ["server"]
