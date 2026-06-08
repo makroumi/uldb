@@ -187,7 +187,7 @@ impl Engine {
                     // because each WAL record is the authoritative latest state.
                     let key_str = std::str::from_utf8(&key).unwrap_or("");
                     let val_str = std::str::from_utf8(&value).unwrap_or("");
-                    indices.bm25.add_document_parts(key.clone(), key_str, val_str);
+                    indices.bm25.add_document_direct(key.clone(), key_str, val_str);
                     indices.fuzzy.add(key_str);
                     memtable.put(key, value);
                 }

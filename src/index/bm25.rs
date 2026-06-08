@@ -169,7 +169,102 @@ impl Bm25Index {
     ///
     /// Removes the document from postings, decrements df, and
     /// recalculates avgdl. Used when a key is deleted or overwritten.
-    /// Index a document from key and value text parts directly.
+    /// Index a document by tokenizing directly into term IDs.
+    /// Zero intermediate String allocation per token.
+    /// Uses a reusable byte buffer for lowercasing.
+    pub fn add_document_direct(&mut self, key: Vec<u8>, key_text: &str, value_text: &str) {
+        let doc_id = self.docs.len();
+        self.key_to_doc.insert(key.clone(), doc_id);
+        self.docs.push(key);
+
+        // Tokenize directly into term IDs. No Vec<String> intermediate.
+        let mut term_freq: Vec<(u32, u32)> = Vec::new(); // (term_id, freq)
+        let mut buf = Vec::with_capacity(32);
+        let mut total_tokens = 0u32;
+
+        // Process both text parts with the same inline tokenizer.
+        for text in &[key_text, value_text] {
+            let bytes = text.as_bytes();
+            let _start = 0;
+            let mut in_token = false;
+            let mut i = 0;
+
+            while i < bytes.len() {
+                let b = bytes[i];
+
+                // camelCase boundary
+                if b.is_ascii_uppercase() && in_token && i > 0 && bytes[i - 1].is_ascii_lowercase() {
+                    if !buf.is_empty() {
+                        total_tokens += 1;
+                        self.intern_and_count(&buf, &mut term_freq);
+                        buf.clear();
+                    }
+                }
+
+                if b.is_ascii_alphanumeric() {
+                    buf.push(b.to_ascii_lowercase());
+                    in_token = true;
+                } else if in_token {
+                    if !buf.is_empty() {
+                        total_tokens += 1;
+                        self.intern_and_count(&buf, &mut term_freq);
+                        buf.clear();
+                    }
+                    in_token = false;
+                }
+                i += 1;
+            }
+
+            if !buf.is_empty() {
+                total_tokens += 1;
+                self.intern_and_count(&buf, &mut term_freq);
+                buf.clear();
+            }
+        }
+
+        self.doc_len.push(total_tokens);
+
+        // Update postings and df from collected term frequencies.
+        let mut term_ids = Vec::with_capacity(term_freq.len());
+        for &(tid, freq) in &term_freq {
+            self.postings.entry(tid).or_default().push((doc_id, freq));
+            *self.df.entry(tid).or_insert(0) += 1;
+            term_ids.push(tid);
+        }
+        self.doc_terms.push(term_ids);
+
+        self.total_doc_len += total_tokens as u64;
+        self.active_docs += 1;
+        self.avgdl = self.total_doc_len as f64 / self.active_docs as f64;
+    }
+
+    /// Intern a lowercased token buffer and update term frequency counts.
+    /// If the term exists, increments its count. Otherwise creates a new term ID.
+    fn intern_and_count(&mut self, buf: &[u8], term_freq: &mut Vec<(u32, u32)>) {
+        // Look up the term by bytes without allocating a String first.
+        // SAFETY: buf contains only ASCII lowercase bytes from to_ascii_lowercase().
+        let token_str = unsafe { std::str::from_utf8_unchecked(buf) };
+
+        let tid = match self.term_ids.get(token_str) {
+            Some(&id) => id,
+            None => {
+                let id = self.term_pool.len() as u32;
+                let owned = token_str.to_string(); // single alloc for new term only
+                self.term_ids.insert(owned, id);
+                self.term_pool.push(String::new());
+                id
+            }
+        };
+
+        // Update frequency: check if this term was already seen in this doc
+        if let Some(entry) = term_freq.iter_mut().find(|(t, _)| *t == tid) {
+            entry.1 += 1;
+        } else {
+            term_freq.push((tid, 1));
+        }
+    }
+
+        /// Index a document from key and value text parts directly.
     /// Avoids allocating a combined content String.
     /// Tokenizes both parts separately and merges token counts.
     pub fn add_document_parts(&mut self, key: Vec<u8>, key_text: &str, value_text: &str) {

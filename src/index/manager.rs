@@ -56,7 +56,7 @@ impl IndexManager {
         // BM25: index key and value text directly, no intermediate String.
         let key_str = unsafe { std::str::from_utf8_unchecked(key) };
         let val_str = unsafe { std::str::from_utf8_unchecked(value) };
-        self.bm25.add_document_parts(key.to_vec(), key_str, val_str);
+        self.bm25.add_document_direct(key.to_vec(), key_str, val_str);
 
         // Fuzzy: index the key as a symbol name.
         self.fuzzy.add(key_str);
