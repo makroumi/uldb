@@ -1,7 +1,9 @@
 // src/query/mod.rs
 //
-// Query subsystem: schema validation, query execution.
+// Query subsystem.
 //
-// Validated: Cell 9 (planner), Cell 17 Gap 5 (executor), Gap 8 (schema)
+// schema:   record validation
+// planner:  deterministic multi-index query routing + RRF merge
 
 pub mod schema;
+pub mod planner;
