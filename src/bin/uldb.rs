@@ -330,10 +330,10 @@ fn main() {
     let fingerprint = cert_fingerprint_sha256_hex(identity.leaf_cert());
     eprintln!("[uldb] certificate fingerprint: {fingerprint}");
 
-    let tls_server = TlsServer::new(identity).unwrap_or_else(|e| {
+    let tls_server = Arc::new(TlsServer::new(identity).unwrap_or_else(|e| {
         eprintln!("[uldb] TLS server init failed: {e}");
         std::process::exit(1);
-    });
+    }));
 
     // Open storage engine
     let config = EngineConfig::new(&data_dir);
@@ -341,8 +341,8 @@ fn main() {
         eprintln!("[uldb] failed to open engine: {e}");
         std::process::exit(1);
     });
-    let handler = UmpHandler::new(engine);
-    let nonce_store = std::sync::Mutex::new(NonceStore::new());
+    let handler = Arc::new(UmpHandler::new(engine));
+    let nonce_store = Arc::new(std::sync::Mutex::new(NonceStore::new()));
 
     // Shutdown signal
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -372,15 +372,23 @@ fn main() {
         match listener.accept() {
             Ok((tcp, _)) => {
                 tcp.set_nonblocking(false).ok();
-                handle_connection(
-                    tcp,
-                    &tls_server,
-                    &handler,
-                    token.as_bytes(),
-                    &nonce_store,
-                    &server_name,
-                    &shutdown,
-                );
+                let tls = Arc::clone(&tls_server);
+                let hdl = Arc::clone(&handler);
+                let nonces = Arc::clone(&nonce_store);
+                let name = server_name.clone();
+                let tok = token.clone();
+                let stop = Arc::clone(&shutdown);
+                std::thread::spawn(move || {
+                    handle_connection(
+                        tcp,
+                        &tls,
+                        &hdl,
+                        tok.as_bytes(),
+                        &nonces,
+                        &name,
+                        &stop,
+                    );
+                });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));

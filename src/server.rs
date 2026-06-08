@@ -36,6 +36,7 @@ use crate::engine::Engine;
 const TAG_U8: u8 = 0x01;
 const TAG_U32: u8 = 0x03;
 const TAG_U64: u8 = 0x04;
+const TAG_F64: u8 = 0x0A;
 const TAG_BYTES: u8 = 0x0C;
 const TAG_STRING: u8 = 0x0D;
 const TAG_END: u8 = 0xFF;
@@ -51,7 +52,7 @@ fn enc(fields: Vec<(u8, Vec<u8>)>) -> Vec<u8> {
                     buf.push(data[0]);
                 }
             }
-            TAG_U32 | TAG_U64 => {
+            TAG_U32 | TAG_U64 | TAG_F64 => {
                 buf.extend_from_slice(&data);
             }
             TAG_BYTES | TAG_STRING => {
@@ -83,6 +84,10 @@ fn u64_field(v: u64) -> (u8, Vec<u8>) {
 
 fn u8_field(v: u8) -> (u8, Vec<u8>) {
     (TAG_U8, vec![v])
+}
+
+fn f64_field(v: f64) -> (u8, Vec<u8>) {
+    (TAG_F64, v.to_bits().to_be_bytes().to_vec())
 }
 
 fn error_response(code: u8, msg: &str) -> Response {
@@ -258,6 +263,48 @@ impl UmpHandler {
         }
         false
     }
+
+    /// Build a streaming query response from index hits.
+    fn build_query_response(
+        &self,
+        eng: &mut Engine,
+        hits: &[crate::query::planner::RankedHit],
+    ) -> Response {
+        let mut frames = Vec::new();
+        frames.push((
+            opcode::OP_RESULT_START,
+            enc(vec![u32_field(hits.len() as u32)]),
+        ));
+
+        for hit in hits {
+            let value = eng.get(&hit.key).unwrap_or_default();
+            let display_key = unscope_key(&hit.key)
+                .map(|k| String::from_utf8_lossy(k).to_string())
+                .unwrap_or_else(|| String::from_utf8_lossy(&hit.key).to_string());
+
+            frames.push((
+                opcode::OP_RESULT_ROW,
+                enc(vec![
+                    string_field(&display_key),
+                    bytes_field(&value),
+                    f64_field(0.0),
+                    f64_field(0.0),
+                    f64_field(0.0),
+                    f64_field(0.0),
+                    f64_field(hit.score),
+                    u32_field(hit.rank as u32),
+                ]),
+            ));
+        }
+
+        frames.push((
+            opcode::OP_RESULT_END,
+            enc(vec![u32_field(hits.len() as u32), u32_field(0)]),
+        ));
+
+        Response::Stream { frames }
+    }
+
 }
 
 impl Handler for UmpHandler {
@@ -280,11 +327,11 @@ impl Handler for UmpHandler {
                 let payload = enc(vec![
                     string_field(&msg.key),
                     bytes_field(&value),
-                    u8_field(0), // vector score placeholder
-                    u8_field(0), // text score placeholder
-                    u8_field(0), // fuzzy score placeholder
-                    u8_field(0), // graph score placeholder
-                    u64_field(0), // final score placeholder
+                    f64_field(0.0), // vector score
+                    f64_field(0.0), // text score
+                    f64_field(0.0), // fuzzy score
+                    f64_field(0.0), // graph score
+                    f64_field(0.0), // final score
                     u32_field(0), // rank
                 ]);
                 Response::Single {
@@ -329,11 +376,11 @@ impl Handler for UmpHandler {
                 enc(vec![
                     string_field(&display_key),
                     bytes_field(value),
-                    u8_field(0),
-                    u8_field(0),
-                    u8_field(0),
-                    u8_field(0),
-                    u64_field(0),
+                    f64_field(0.0),
+                    f64_field(0.0),
+                    f64_field(0.0),
+                    f64_field(0.0),
+                    f64_field(0.0),
                     u32_field(i as u32),
                 ]),
             ));
@@ -454,11 +501,11 @@ impl Handler for UmpHandler {
                 enc(vec![
                     string_field(&display_key),
                     bytes_field(&value),
-                    u8_field(0),
-                    u8_field(0),
-                    u8_field(0),
-                    u8_field(0),
-                    u64_field(hit.score.to_bits()),
+                    f64_field(0.0), // vector score
+                    f64_field(0.0), // text score
+                    f64_field(0.0), // fuzzy score
+                    f64_field(0.0), // graph score
+                    f64_field(hit.score), // final score
                     u32_field(hit.rank as u32),
                 ]),
             ));
@@ -475,12 +522,82 @@ impl Handler for UmpHandler {
         Response::Stream { frames }
     }
 
-    fn handle_query_fuzzy(&self, _msg: query::QueryFuzzy) -> Response {
+    fn handle_get_batch(&self, msg: record::GetBatch) -> Response {
+        let ns_id = 0u64;
         let mut frames = Vec::new();
-        frames.push((opcode::OP_RESULT_START, enc(vec![u32_field(0)])));
-        frames.push((opcode::OP_RESULT_END, enc(vec![u32_field(0), u32_field(0)])));
+        let mut eng = self.engine.lock().unwrap();
+        let mut found = 0u32;
+
+        frames.push((
+            opcode::OP_RESULT_START,
+            enc(vec![u32_field(msg.keys.len() as u32)]),
+        ));
+
+        for (i, key) in msg.keys.iter().enumerate() {
+            let scoped = scope_key(ns_id, key.as_bytes());
+            let value = eng.get(&scoped).unwrap_or_default();
+            if !value.is_empty() {
+                found += 1;
+            }
+            frames.push((
+                opcode::OP_RESULT_ROW,
+                enc(vec![
+                    string_field(key),
+                    bytes_field(&value),
+                    f64_field(0.0),
+                    f64_field(0.0),
+                    f64_field(0.0),
+                    f64_field(0.0),
+                    f64_field(0.0),
+                    u32_field(i as u32),
+                ]),
+            ));
+        }
+
+        frames.push((
+            opcode::OP_RESULT_END,
+            enc(vec![u32_field(found), u32_field(0)]),
+        ));
+
         Response::Stream { frames }
     }
+
+    fn handle_query_fuzzy(&self, msg: query::QueryFuzzy) -> Response {
+        let mut eng = self.engine.lock().unwrap();
+        let spec = crate::query::planner::QuerySpec {
+            text: msg.query,
+            top_k: msg.top_k as usize,
+            ..Default::default()
+        };
+        let hits = eng.indices.query(&spec);
+        self.build_query_response(&mut eng, &hits)
+    }
+
+    fn handle_query_vector(&self, msg: query::QueryVector) -> Response {
+        let mut eng = self.engine.lock().unwrap();
+        let spec = crate::query::planner::QuerySpec {
+            vector: msg.vector,
+            top_k: msg.top_k as usize,
+            ..Default::default()
+        };
+        let hits = eng.indices.query(&spec);
+        self.build_query_response(&mut eng, &hits)
+    }
+
+    fn handle_query_graph(&self, msg: query::QueryGraph) -> Response {
+        let mut eng = self.engine.lock().unwrap();
+        let spec = crate::query::planner::QuerySpec {
+            text: msg.start_key,
+            relations: msg.relations,
+            top_k: msg.top_k as usize,
+            max_depth: msg.max_depth as usize,
+            ..Default::default()
+        };
+        let hits = eng.indices.query(&spec);
+        self.build_query_response(&mut eng, &hits)
+    }
+
+
 
     fn handle_query_keyword(&self, msg: query::QueryKeyword) -> Response {
         self.handle_query(query::Query {
