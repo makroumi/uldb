@@ -281,6 +281,9 @@ impl Engine {
         let should_flush = self.memtable.delete(key.to_vec());
         self.total_deletes.fetch_add(1, Ordering::Relaxed);
 
+        // Remove from indices.
+        self.indices.on_delete(key);
+
         // Update HAMT state.
         self.state = self.state.delete(key);
 
@@ -419,6 +422,7 @@ impl Engine {
             page.push(key, value, tombstone);
         }
         page.sort();
+        page.build_bloom();
         page
     }
 

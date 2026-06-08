@@ -17,6 +17,7 @@
 
 use super::super::storage::fnv;
 
+#[derive(Debug)]
 pub struct BloomFilter {
     bits: Vec<u64>,       // bit array packed into u64 words
     num_bits: usize,      // m

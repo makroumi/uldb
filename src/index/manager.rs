@@ -50,6 +50,9 @@ impl IndexManager {
     pub fn on_put(&mut self, key: &[u8], value: &[u8]) {
         let key_str = String::from_utf8_lossy(key);
 
+        // Remove old entry if overwriting (prevents stale BM25 results)
+        self.bm25.remove_document(key);
+
         // BM25: index key + value text
         let content = format!(
             "{} {}",
@@ -60,6 +63,15 @@ impl IndexManager {
 
         // Fuzzy: index the key as a symbol name
         self.fuzzy.add(&key_str);
+    }
+
+    /// Called when a record is deleted.
+    /// Removes the key from BM25 and fuzzy indices.
+    pub fn on_delete(&mut self, key: &[u8]) {
+        self.bm25.remove_document(key);
+        // Fuzzy matcher is append-only by design (trigram index).
+        // Deleted symbols will score low due to missing BM25 signal
+        // in multi-index RRF merge, which is acceptable.
     }
 
     /// Called when a vector embedding is associated with a key.

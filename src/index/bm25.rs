@@ -128,7 +128,52 @@ impl Bm25Index {
         self.avgdl = total_len as f64 / self.doc_len.len() as f64;
     }
 
-    /// Search with a natural-language or keyword query.
+    /// Remove a document from the index by key.
+    ///
+    /// Removes the document from postings, decrements df, and
+    /// recalculates avgdl. Used when a key is deleted or overwritten.
+    pub fn remove_document(&mut self, key: &[u8]) {
+        // Find the doc_id for this key
+        let doc_id = match self.docs.iter().position(|k| k == key) {
+            Some(id) => id,
+            None => return, // not indexed
+        };
+
+
+        // Remove from postings and update df
+        let mut empty_terms = Vec::new();
+        for (term, entries) in self.postings.iter_mut() {
+            let before = entries.len();
+            entries.retain(|(id, _)| *id != doc_id);
+            if entries.len() < before {
+                if let Some(df) = self.df.get_mut(term) {
+                    *df = df.saturating_sub(1);
+                }
+            }
+            if entries.is_empty() {
+                empty_terms.push(term.clone());
+            }
+        }
+        for term in empty_terms {
+            self.postings.remove(&term);
+            self.df.remove(&term);
+        }
+
+        // Mark doc as removed (empty key so it won't match future lookups)
+        self.docs[doc_id] = Vec::new();
+        self.doc_len[doc_id] = 0;
+
+        // Recalculate avgdl
+        let total_len: u64 = self.doc_len.iter().map(|&l| l as u64).sum();
+        let active_docs = self.docs.iter().filter(|k| !k.is_empty()).count();
+        self.avgdl = if active_docs > 0 {
+            total_len as f64 / active_docs as f64
+        } else {
+            0.0
+        };
+    }
+
+        /// Search with a natural-language or keyword query.
     ///
     /// Returns top_k results sorted by score descending.
     ///

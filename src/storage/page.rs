@@ -25,6 +25,8 @@
 
 use std::io;
 
+use crate::index::bloom::BloomFilter;
+
 const PAGE_MAGIC: &[u8; 4] = b"ULPG";
 const PAGE_VERSION: u8 = 1;
 const RECORD_MAGIC: &[u8; 4] = b"ULRC";
@@ -42,6 +44,7 @@ pub struct PageRecord {
 pub struct Page {
     pub records: Vec<PageRecord>,
     pub level: u32,
+    bloom: Option<BloomFilter>,
 }
 
 impl Page {
@@ -49,6 +52,7 @@ impl Page {
         Self {
             records: Vec::new(),
             level,
+            bloom: None,
         }
     }
 
@@ -58,6 +62,30 @@ impl Page {
 
     pub fn sort(&mut self) {
         self.records.sort_by(|a, b| a.key.cmp(&b.key));
+    }
+
+    /// Build a bloom filter from the current records.
+    /// Call after sort() and before using get() for optimal performance.
+    pub fn build_bloom(&mut self) {
+        if self.records.is_empty() {
+            return;
+        }
+        let mut bf = BloomFilter::new(self.records.len().max(16), 0.01);
+        for rec in &self.records {
+            if !rec.tombstone {
+                bf.add(&rec.key);
+            }
+        }
+        self.bloom = Some(bf);
+    }
+
+    /// Check bloom filter for a key. Returns true if key might exist,
+    /// false if key definitely does not exist in this page.
+    pub fn bloom_may_contain(&self, key: &[u8]) -> bool {
+        match &self.bloom {
+            Some(bf) => bf.may_contain(key),
+            None => true, // no bloom filter, assume key might exist
+        }
     }
 
     /// Serialize to binary format.
@@ -110,6 +138,7 @@ impl Page {
 
         let body = &data[17..17 + compressed_size];
         let mut page = Page::new(0);
+        // bloom filter will be built after loading if needed
         let mut pos = 0;
 
         while pos < body.len() {
