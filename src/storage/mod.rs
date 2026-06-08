@@ -19,3 +19,4 @@ pub mod page;
 pub mod compaction;
 pub mod bg_compaction;
 pub mod page_store;
+pub mod cache;

@@ -48,6 +48,7 @@ use crate::storage::wal::{WalWriter, WalReader};
 use crate::storage::memtable::Memtable;
 use crate::storage::page::Page;
 use crate::storage::bg_compaction::BackgroundCompactor;
+use crate::storage::cache::LruCache;
 use crate::index::manager::IndexManager;
 use crate::tx::hamt::Hamt;
 
@@ -101,6 +102,7 @@ pub struct Engine {
     total_puts: AtomicU64,
     total_gets: AtomicU64,
     total_deletes: AtomicU64,
+    cache: std::sync::Mutex<LruCache>,
 }
 
 impl Engine {
@@ -216,6 +218,7 @@ impl Engine {
             total_puts: AtomicU64::new(0),
             total_gets: AtomicU64::new(0),
             total_deletes: AtomicU64::new(0),
+            cache: std::sync::Mutex::new(LruCache::new(1024)),
         })
     }
 
@@ -233,6 +236,9 @@ impl Engine {
         let should_flush = self.memtable.put(key.to_vec(), value.to_vec());
         self.total_puts.fetch_add(1, Ordering::Relaxed);
 
+        // Invalidate cache for this key.
+        { self.cache.lock().unwrap().invalidate(key); }
+
         // Index for queries.
         self.indices.on_put(key, value);
 
@@ -246,7 +252,38 @@ impl Engine {
         Ok(())
     }
 
-    /// Read one key.
+    /// Write multiple key-value pairs with a single WAL flush.
+    ///
+    /// More efficient than calling put() in a loop because the WAL
+    /// buffer is flushed only once for the entire batch.
+    pub fn put_batch(&mut self, entries: &[(&[u8], &[u8])]) -> io::Result<()> {
+        // Append all to WAL without flushing per entry.
+        for &(key, value) in entries {
+            self.wal.append(key, value)?;
+        }
+        // Single flush for the entire batch.
+        self.wal.flush()?;
+
+        // Insert all into memtable and indices.
+        let mut should_flush = false;
+        for &(key, value) in entries {
+            if self.memtable.put(key.to_vec(), value.to_vec()) {
+                should_flush = true;
+            }
+            self.total_puts.fetch_add(1, Ordering::Relaxed);
+            { self.cache.lock().unwrap().invalidate(key); }
+            self.indices.on_put(key, value);
+            self.state = self.state.put(key.to_vec(), value.to_vec());
+        }
+
+        if should_flush {
+            self.flush_memtable()?;
+        }
+
+        Ok(())
+    }
+
+        /// Read one key.
     ///
     /// Checks the memtable first (hot data), then falls back to
     /// compaction levels (cold data).
@@ -255,18 +292,34 @@ impl Engine {
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.total_gets.fetch_add(1, Ordering::Relaxed);
 
-        // Check memtable first.
+        // Check memtable first (hot writes).
         if self.memtable.contains(key) {
             if self.memtable.is_tombstone(key) {
-                return None; // deleted
+                return None;
             }
             return self.memtable.get(key).map(|v| v.to_vec());
         }
 
+        // Check LRU cache (hot reads).
+        {
+            let mut lru = self.cache.lock().unwrap();
+            if let Some(val) = lru.get(key) {
+                return Some(val);
+            }
+        }
+
         // Fall back to compacted pages.
         let state = self.compactor.state();
-        let c = state.lock().unwrap();
-        c.get(key)
+        let cm = state.lock().unwrap();
+        let result = cm.get(key);
+
+        // Populate cache on hit.
+        if let Some(ref val) = result {
+            let mut lru = self.cache.lock().unwrap();
+            lru.insert(key.to_vec(), val.clone());
+        }
+
+        result
     }
 
     /// Delete one key by writing a tombstone.
@@ -280,6 +333,9 @@ impl Engine {
 
         let should_flush = self.memtable.delete(key.to_vec());
         self.total_deletes.fetch_add(1, Ordering::Relaxed);
+
+        // Invalidate cache for this key.
+        { self.cache.lock().unwrap().invalidate(key); }
 
         // Remove from indices.
         self.indices.on_delete(key);

@@ -301,6 +301,42 @@ impl HnswIndex {
             .collect()
     }
 
+    /// Search with a custom ef_search parameter.
+    /// Higher ef_search = better recall but slower.
+    pub fn search_with_ef(&self, query: &[f32], k: usize, ef_override: usize) -> Vec<SearchResult> {
+        if self.nodes.is_empty() || k == 0 || query.len() != self.dim {
+            return Vec::new();
+        }
+
+        let mut qv = query.to_vec();
+        if !normalize(&mut qv) {
+            return Vec::new();
+        }
+
+        let ep_level = self.entry_level;
+        let mut ep = self.entry_point.unwrap();
+
+        for lyr in (1..=ep_level).rev() {
+            let cands = self.search_layer_vec(&qv, ep, 1, lyr);
+            if let Some(&(_, c)) = cands.first() { ep = c; }
+        }
+
+        let ef = ef_override.max(k);
+        let mut cands = self.search_layer_vec(&qv, ep, ef, 0);
+        cands.sort_by(|a, b| a.0.cmp(&b.0));
+        cands.truncate(k);
+
+        cands
+            .into_iter()
+            .enumerate()
+            .map(|(rank, (dist, idx))| SearchResult {
+                key: self.nodes[idx].key.clone(),
+                distance: dist.val(),
+                rank,
+            })
+            .collect()
+    }
+
     // =========================================================================
     // Internal helpers
     // =========================================================================

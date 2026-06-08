@@ -408,14 +408,21 @@ impl Handler for UmpHandler {
         let mut eng = self.engine.write().unwrap();
         let count = msg.records.len();
 
-        for (key, value) in msg.records {
-            let scoped = scope_key(ns_id, key.as_bytes());
-            if let Err(e) = eng.put(&scoped, &value) {
-                return error_response(0xFF, &format!("batch put failed: {e}"));
-            }
-        }
+        // Scope all keys and collect for batch write.
+        let scoped: Vec<(Vec<u8>, Vec<u8>)> = msg.records
+            .into_iter()
+            .map(|(key, value)| (scope_key(ns_id, key.as_bytes()), value))
+            .collect();
 
-        result_end_response(count as u32, 0)
+        let refs: Vec<(&[u8], &[u8])> = scoped
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+
+        match eng.put_batch(&refs) {
+            Ok(()) => result_end_response(count as u32, 0),
+            Err(e) => error_response(0xFF, &format!("batch put failed: {e}")),
+        }
     }
 
     fn handle_range_delete(&self, msg: record::RangeDelete) -> Response {

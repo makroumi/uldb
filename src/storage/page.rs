@@ -23,7 +23,11 @@
 //   [val bytes]
 //   [1B tombstone flag]
 
-use std::io;
+use std::io::{self, Read};
+
+use flate2::read::DeflateDecoder;
+use flate2::write::DeflateEncoder;
+use flate2::Compression;
 
 use crate::index::bloom::BloomFilter;
 
@@ -100,17 +104,27 @@ impl Page {
             body.push(if rec.tombstone { 1 } else { 0 });
         }
 
-        // Store uncompressed. compressed_size == uncompressed_size signals
-        // identity encoding. zlib will be added as an optional feature.
-        let body_len = body.len() as u32;
+        let uncompressed_size = body.len() as u32;
 
-        let mut out = Vec::with_capacity(17 + body.len());
+        // Compress with deflate. Only use compressed form if it
+        // is strictly smaller than raw body.
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+        io::Write::write_all(&mut encoder, &body)?;
+        let compressed = encoder.finish()?;
+
+        let (stored, compressed_size) = if (compressed.len() as u32) < uncompressed_size {
+            (&compressed[..], compressed.len() as u32)
+        } else {
+            (&body[..], uncompressed_size)
+        };
+
+        let mut out = Vec::with_capacity(17 + stored.len());
         out.extend_from_slice(PAGE_MAGIC);
         out.push(PAGE_VERSION);
         out.extend_from_slice(&(self.records.len() as u32).to_be_bytes());
-        out.extend_from_slice(&body_len.to_be_bytes()); // uncompressed_size
-        out.extend_from_slice(&body_len.to_be_bytes()); // compressed_size
-        out.extend_from_slice(&body);
+        out.extend_from_slice(&uncompressed_size.to_be_bytes());
+        out.extend_from_slice(&compressed_size.to_be_bytes());
+        out.extend_from_slice(stored);
         Ok(out)
     }
 
@@ -127,7 +141,7 @@ impl Page {
         let _version = data[4];
         let record_count =
             u32::from_be_bytes([data[5], data[6], data[7], data[8]]) as usize;
-        let _uncompressed =
+        let uncompressed_size =
             u32::from_be_bytes([data[9], data[10], data[11], data[12]]);
         let compressed_size =
             u32::from_be_bytes([data[13], data[14], data[15], data[16]]) as usize;
@@ -136,9 +150,20 @@ impl Page {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "page truncated"));
         }
 
-        let body = &data[17..17 + compressed_size];
+        let raw = &data[17..17 + compressed_size];
+
+        // Decompress if compressed_size != uncompressed_size
+        let body: Vec<u8> = if compressed_size < uncompressed_size as usize {
+            let mut decoder = DeflateDecoder::new(raw);
+            let mut decompressed = Vec::with_capacity(uncompressed_size as usize);
+            decoder.read_to_end(&mut decompressed)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            decompressed
+        } else {
+            raw.to_vec()
+        };
+
         let mut page = Page::new(0);
-        // bloom filter will be built after loading if needed
         let mut pos = 0;
 
         while pos < body.len() {
@@ -252,6 +277,47 @@ mod tests {
     }
 
     #[test]
+    fn compression_reduces_page_size() {
+        // 100 records with repetitive patterns should compress well
+        let mut page = Page::new(0);
+        for i in 0..100u32 {
+            page.push(
+                format!("auth.py::function_{i:04}").into_bytes(),
+                format!("def function_{i}(arg): return validate_token(arg)").into_bytes(),
+                false,
+            );
+        }
+        page.sort();
+
+        let serialized = page.serialize().unwrap();
+
+        // Calculate what uncompressed size would be
+        let mut raw_body_size: usize = 0;
+        for rec in &page.records {
+            raw_body_size += 4 + 2 + 4 + rec.key.len() + rec.value.len() + 1;
+        }
+        let header_size = 17;
+
+        // Compressed page should be significantly smaller than raw
+        let ratio = serialized.len() as f64 / (header_size + raw_body_size) as f64;
+        assert!(
+            ratio < 0.7,
+            "compression ratio {ratio:.2} is not effective enough              (serialized={}, raw={}, expected < 0.7)",
+            serialized.len(),
+            header_size + raw_body_size,
+        );
+
+        // Roundtrip must be lossless
+        let page2 = Page::deserialize(&serialized).unwrap();
+        assert_eq!(page2.len(), 100);
+        for i in 0..100u32 {
+            let key = format!("auth.py::function_{i:04}");
+            let val = format!("def function_{i}(arg): return validate_token(arg)");
+            assert_eq!(page2.get(key.as_bytes()), Some(val.as_bytes()));
+        }
+    }
+
+        #[test]
     fn binary_search_works() {
         let mut page = Page::new(0);
         for i in 0..1000u32 {
