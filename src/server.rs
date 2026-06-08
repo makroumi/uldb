@@ -402,7 +402,28 @@ impl Handler for UmpHandler {
             timeout_ms: msg.timeout_ms,
         };
 
-        let hits = eng.indices.query(&spec);
+        let all_hits = eng.indices.query(&spec);
+
+        // Filter hits by namespace if a namespace was specified.
+        // Index keys are stored with the handler's ns_id=0 prefix followed
+        // by the application-level namespace prefix. When a query specifies
+        // a namespace, we resolve it to a u64 and keep only hits whose key
+        // (after the handler's 8-byte prefix) belongs to that namespace.
+        let query_ns = resolve_ns(&msg.namespace);
+        let hits: Vec<_> = if query_ns != 0 {
+            let ns_prefix = query_ns.to_be_bytes();
+            all_hits
+                .into_iter()
+                .filter(|hit| {
+                    // The hit key is the full stored key including the
+                    // handler's ns_id=0 prefix. The application namespace
+                    // starts at byte 8. Check if bytes 8..16 match.
+                    hit.key.len() >= 16 && hit.key[8..16] == ns_prefix
+                })
+                .collect()
+        } else {
+            all_hits
+        };
 
         let mut frames = Vec::new();
         frames.push((
@@ -410,17 +431,25 @@ impl Handler for UmpHandler {
             enc(vec![u32_field(hits.len() as u32)]),
         ));
 
-        let ns_id = 0u64;
         for hit in &hits {
-            // Look up the actual value from storage.
-            // Hit keys from indices are unscoped; scope them for lookup.
-            let scoped_lookup = scope_key(ns_id, &hit.key);
-            let value = eng.get(&scoped_lookup).unwrap_or_default();
-            let key_str = String::from_utf8_lossy(&hit.key);
+            // Hit keys are already the full stored keys. Look up the value
+            // directly without re-scoping.
+            let value = eng.get(&hit.key).unwrap_or_default();
+
+            // Display key: strip the handler's ns_id=0 prefix, then strip
+            // the application namespace prefix if present.
+            let display_key = if hit.key.len() >= 16 {
+                String::from_utf8_lossy(&hit.key[16..]).to_string()
+            } else {
+                unscope_key(&hit.key)
+                    .map(|k| String::from_utf8_lossy(k).to_string())
+                    .unwrap_or_else(|| String::from_utf8_lossy(&hit.key).to_string())
+            };
+
             frames.push((
                 opcode::OP_RESULT_ROW,
                 enc(vec![
-                    string_field(&key_str),
+                    string_field(&display_key),
                     bytes_field(&value),
                     u8_field(0),
                     u8_field(0),
