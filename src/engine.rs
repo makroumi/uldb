@@ -46,6 +46,7 @@ use crate::storage::wal::{WalWriter, WalReader};
 use crate::storage::memtable::Memtable;
 use crate::storage::page::Page;
 use crate::storage::compaction::CompactionManager;
+use crate::index::manager::IndexManager;
 
 /// Default memtable flush threshold: 4MB.
 const DEFAULT_FLUSH_THRESHOLD: usize = 4 * 1024 * 1024;
@@ -83,6 +84,7 @@ pub struct Engine {
     wal: WalWriter,
     memtable: Memtable,
     compaction: CompactionManager,
+    pub indices: IndexManager,
     flush_count: u64,
     total_puts: u64,
     total_gets: u64,
@@ -144,6 +146,7 @@ impl Engine {
             wal,
             memtable,
             compaction,
+            indices: IndexManager::new(),
             flush_count: 0,
             total_puts: 0,
             total_gets: 0,
@@ -164,6 +167,9 @@ impl Engine {
         // Memtable second (fast reads).
         let should_flush = self.memtable.put(key.to_vec(), value.to_vec());
         self.total_puts += 1;
+
+        // Index for queries.
+        self.indices.on_put(key, value);
 
         if should_flush {
             self.flush_memtable()?;

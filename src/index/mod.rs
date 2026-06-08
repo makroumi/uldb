@@ -2,14 +2,16 @@
 //
 // Index subsystem.
 //
-// bloom:  probabilistic membership filter
-// fuzzy:  trigram + Levenshtein symbol search
-// hnsw:   approximate nearest neighbor vector search
-// graph:  CSR relation graph
-// bm25:   inverted index for keyword search
+// bloom:    probabilistic membership filter
+// fuzzy:    trigram + Levenshtein symbol search
+// hnsw:     approximate nearest neighbor vector search
+// graph:    CSR relation graph
+// bm25:     inverted index for keyword search
+// manager:  coordinates all indices for multi-index queries
 
 pub mod bloom;
 pub mod fuzzy;
 pub mod hnsw;
 pub mod graph;
 pub mod bm25;
+pub mod manager;

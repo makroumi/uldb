@@ -227,40 +227,43 @@ impl Handler for UmpHandler {
 
     fn handle_query(&self, msg: query::Query) -> Response {
         let mut eng = self.engine.lock().unwrap();
-        let text = msg.text.to_lowercase();
-        let limit = msg.top_k as usize;
 
-        let all = eng.scan(b"\x00", b"\xff");
-        let mut matches: Vec<(String, Vec<u8>)> = Vec::new();
+        let spec = crate::query::planner::QuerySpec {
+            text: msg.text,
+            vector: msg.vector,
+            top_k: msg.top_k as usize,
+            max_depth: msg.max_depth as usize,
+            relations: msg.relations,
+            lang_filter: msg.lang_filter,
+            type_filter: msg.type_filter,
+            file_filter: msg.file_filter,
+            merge_strategy: msg.merge_strategy,
+            timeout_ms: msg.timeout_ms,
+        };
 
-        for (key, value) in all {
-            let key_str = String::from_utf8_lossy(&key).to_lowercase();
-            if key_str.contains(&text) || text.is_empty() {
-                matches.push((String::from_utf8_lossy(&key).to_string(), value));
-                if matches.len() >= limit {
-                    break;
-                }
-            }
-        }
+        let hits = eng.indices.query(&spec);
 
         let mut frames = Vec::new();
         frames.push((
             opcode::OP_RESULT_START,
-            enc(vec![u32_field(matches.len() as u32)]),
+            enc(vec![u32_field(hits.len() as u32)]),
         ));
 
-        for (i, (key, value)) in matches.iter().enumerate() {
+        for hit in &hits {
+            // Look up the actual value from storage.
+            let value = eng.get(&hit.key).unwrap_or_default();
+            let key_str = String::from_utf8_lossy(&hit.key);
             frames.push((
                 opcode::OP_RESULT_ROW,
                 enc(vec![
-                    string_field(key),
-                    bytes_field(value),
+                    string_field(&key_str),
+                    bytes_field(&value),
                     u8_field(0),
                     u8_field(0),
                     u8_field(0),
                     u8_field(0),
-                    u64_field(0),
-                    u32_field(i as u32),
+                    u64_field(hit.score.to_bits()),
+                    u32_field(hit.rank as u32),
                 ]),
             ));
         }
@@ -268,7 +271,7 @@ impl Handler for UmpHandler {
         frames.push((
             opcode::OP_RESULT_END,
             enc(vec![
-                u32_field(matches.len() as u32),
+                u32_field(hits.len() as u32),
                 u32_field(0),
             ]),
         ));
