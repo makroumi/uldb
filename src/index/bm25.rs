@@ -359,19 +359,22 @@ impl Bm25Index {
         }
 
         let n_docs = self.docs.len() as f64;
-        let mut scores: HashMap<usize, f64> = HashMap::new();
+
+        // Score accumulation: use Vec indexed by doc_id for O(1) access.
+        // Only allocate for docs we actually touch.
+        let mut scores: Vec<f64> = vec![0.0; self.docs.len()];
+        let mut touched: Vec<usize> = Vec::new();
 
         for term in q_terms {
             let tid = match self.term_ids.get(&term) {
                 Some(&id) => id,
-                None => continue, // unseen term
+                None => continue,
             };
             let df = match self.df.get(&tid) {
                 Some(&df) => df as f64,
                 None => continue,
             };
 
-            // BM25 IDF
             let idf = ((n_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
 
             let postings = match self.postings.get(&tid) {
@@ -389,30 +392,46 @@ impl Bm25Index {
                 let denom = tf + self.k1 * (1.0 - self.b + self.b * dl / self.avgdl.max(1e-9));
                 let score = idf * (tf * (self.k1 + 1.0)) / denom;
 
-                *scores.entry(doc_id).or_insert(0.0) += score;
+                if scores[doc_id] == 0.0 {
+                    touched.push(doc_id);
+                }
+                scores[doc_id] += score;
             }
         }
 
-        let mut results: Vec<Bm25Result> = scores
-            .into_iter()
-            .map(|(doc_id, score)| Bm25Result {
-                key: self.docs[doc_id].clone(),
-                score,
-                rank: 0,
-            })
+        // Collect only touched docs and use partial sort for top-k.
+        // For small result sets (< 4*top_k), full sort is faster than heap.
+        // For large result sets, use select_nth_unstable for O(n) partitioning.
+        let mut candidates: Vec<(usize, f64)> = touched
+            .iter()
+            .map(|&id| (id, scores[id]))
             .collect();
 
-        results.sort_by(|a, b| {
-            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        results.truncate(top_k);
-
-        for (i, r) in results.iter_mut().enumerate() {
-            r.rank = i;
+        if candidates.len() <= top_k {
+            // All candidates fit, just sort by score descending.
+            candidates.sort_unstable_by(|a, b|
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            );
+        } else {
+            // Partial sort: partition around the k-th element, then sort top-k.
+            candidates.select_nth_unstable_by(top_k, |a, b|
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            );
+            candidates.truncate(top_k);
+            candidates.sort_unstable_by(|a, b|
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            );
         }
 
-        results
+        candidates
+            .iter()
+            .enumerate()
+            .map(|(rank, &(doc_id, score))| Bm25Result {
+                key: self.docs[doc_id].clone(),
+                score,
+                rank,
+            })
+            .collect()
     }
 }
 
