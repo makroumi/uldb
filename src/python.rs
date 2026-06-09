@@ -346,6 +346,21 @@ impl Client {
         })
     }
 
+    /// Create an isolated agent workspace.
+    fn agent(&self, name: &str) -> PyResult<Agent> {
+        let eng = self.get_engine()?;
+        let mut e = eng.write()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        e.branch_create(name, "")
+            .map_err(|e| PyRuntimeError::new_err(format!("agent create failed: {e}")))?;
+        drop(e);
+        Ok(Agent {
+            engine: eng.clone(),
+            name: name.to_string(),
+            
+        })
+    }
+
     /// List all branches.
     fn branches(&self) -> PyResult<Vec<String>> {
         let eng = self.get_engine()?;
@@ -424,6 +439,185 @@ impl Client {
 // ============================================================================
 // Convenience: DB as a simpler alias
 // ============================================================================
+
+// ============================================================================
+// Agent: the unified agentic AI primitive
+// ============================================================================
+
+/// An isolated agent workspace with search capabilities.
+/// Combines branch + workspace + context into one concept.
+///
+///     with app.agent("refactor-auth") as agent:
+///         docs = agent.search("validate token")
+///         agent.put("auth.py::validate", b"def validate_v2(): ...")
+///         # auto-merge on clean exit
+///         # auto-rollback on exception
+#[pyclass]
+struct Agent {
+    engine: Arc<RwLock<Engine>>,
+    name: String,
+}
+
+#[pymethods]
+impl Agent {
+    /// Search the shared index. Returns documents ranked by relevance.
+    #[pyo3(signature = (query, limit=10))]
+    fn search(&self, query: &str, limit: usize) -> PyResult<Vec<Document>> {
+        let mut eng = self.engine.write()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        let spec = QuerySpec {
+            text: query.to_string(),
+            top_k: limit,
+            ..Default::default()
+        };
+        let hits = eng.indices.query(&spec);
+        Ok(hits.into_iter().map(|h| {
+            let value = eng.get(&h.key).unwrap_or_default();
+            Document {
+                id: String::from_utf8_lossy(&h.key).to_string(),
+                content_bytes: value,
+                meta: HashMap::new(),
+                score: h.score,
+            }
+        }).collect())
+    }
+
+    /// Fuzzy symbol search (typo-tolerant).
+    #[pyo3(signature = (symbol, limit=5))]
+    fn search_fuzzy(&self, symbol: &str, limit: usize) -> PyResult<Vec<Document>> {
+        let eng = self.engine.read()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        let results = eng.indices.fuzzy.query(symbol, limit);
+        Ok(results.into_iter().map(|m| {
+            let value = eng.get(m.symbol.as_bytes()).unwrap_or_default();
+            Document {
+                id: m.symbol,
+                content_bytes: value,
+                meta: HashMap::new(),
+                score: m.jaccard,
+            }
+        }).collect())
+    }
+
+    /// Read a document. Reads from agent branch first, then live engine.
+    fn get(&self, path: &str) -> PyResult<Option<Document>> {
+        let eng = self.engine.read()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        // Check agent's branch HAMT first (isolated writes)
+        if let Some(val) = eng.snapshot_get(&self.name, path.as_bytes()) {
+            return Ok(Some(Document {
+                id: path.to_string(),
+                content_bytes: val,
+                meta: HashMap::new(),
+                score: 0.0,
+            }));
+        }
+        // Fall back to live engine
+        match eng.get(path.as_bytes()) {
+            Some(value) => Ok(Some(Document {
+                id: path.to_string(),
+                content_bytes: value,
+                meta: HashMap::new(),
+                score: 0.0,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Write a document in isolation. Only visible to this agent until commit.
+    fn put(&self, path: &str, content: &[u8]) -> PyResult<()> {
+        let mut eng = self.engine.write()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        let branch = eng.snapshots.get(&self.name)
+            .cloned()
+            .ok_or_else(|| PyRuntimeError::new_err("agent branch not found"))?;
+        let updated = branch.put(path.as_bytes().to_vec(), content.to_vec());
+        eng.snapshots.insert(self.name.clone(), updated);
+        Ok(())
+    }
+
+    /// Delete a document in isolation.
+    fn delete(&self, path: &str) -> PyResult<()> {
+        let mut eng = self.engine.write()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        let branch = eng.snapshots.get(&self.name)
+            .cloned()
+            .ok_or_else(|| PyRuntimeError::new_err("agent branch not found"))?;
+        let updated = branch.delete(path.as_bytes());
+        eng.snapshots.insert(self.name.clone(), updated);
+        Ok(())
+    }
+
+    /// Scan documents by prefix.
+    #[pyo3(signature = (prefix, limit=100))]
+    fn scan(&self, prefix: &str, limit: usize) -> PyResult<Vec<Document>> {
+        let eng = self.engine.read()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        let start = prefix.as_bytes();
+        let mut end = start.to_vec();
+        end.push(0xFF);
+        Ok(eng.scan(start, &end).into_iter().take(limit).map(|(k, v)| {
+            Document {
+                id: String::from_utf8_lossy(&k).to_string(),
+                content_bytes: v,
+                meta: HashMap::new(),
+                score: 0.0,
+            }
+        }).collect())
+    }
+
+    /// Bulk write documents in isolation.
+    fn load(&self, records: HashMap<String, Vec<u8>>) -> PyResult<usize> {
+        let mut eng = self.engine.write()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        let mut branch = eng.snapshots.get(&self.name)
+            .cloned()
+            .ok_or_else(|| PyRuntimeError::new_err("agent branch not found"))?;
+        let mut count = 0;
+        for (k, v) in records {
+            branch = branch.put(k.into_bytes(), v);
+            count += 1;
+        }
+        eng.snapshots.insert(self.name.clone(), branch);
+        Ok(count)
+    }
+
+    /// Manually commit (merge) this agent's work to main.
+    fn commit(&self) -> PyResult<usize> {
+        let mut eng = self.engine.write()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        eng.branch_merge(&self.name)
+            .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Manually discard all agent's work.
+    fn discard(&self) -> PyResult<()> {
+        let mut eng = self.engine.write()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        eng.branch_rollback(&self.name);
+        Ok(())
+    }
+
+    /// Context manager: auto-merge on clean exit, auto-rollback on exception.
+    fn __enter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __exit__(&self, exc_type: Option<&Bound<PyAny>>, _ev: Option<&Bound<PyAny>>, _tb: Option<&Bound<PyAny>>) -> PyResult<bool> {
+        let mut eng = self.engine.write()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        if exc_type.is_some() {
+            eng.branch_rollback(&self.name);
+        } else {
+            let _ = eng.branch_merge(&self.name);
+        }
+        Ok(false)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Agent({:?})", self.name)
+    }
+}
 
 /// The simplest way to use uldb. One class does everything.
 ///
@@ -529,6 +723,26 @@ impl DB {
         Ok(e.snapshot_list())
     }
 
+    /// Create an isolated agent workspace.
+    ///
+    /// Usage:
+    ///     with db.agent("refactor-auth") as agent:
+    ///         docs = agent.search("validate")
+    ///         agent.put("key", b"new value")
+    ///         # auto-merge on success, auto-rollback on failure
+    fn agent(&self, name: &str) -> PyResult<Agent> {
+        let eng = self.eng()?;
+        let mut e = eng.write().map_err(|_| PyRuntimeError::new_err("lock"))?;
+        e.branch_create(name, "")
+            .map_err(|e| PyRuntimeError::new_err(format!("agent create failed: {e}")))?;
+        drop(e);
+        Ok(Agent {
+            engine: eng.clone(),
+            name: name.to_string(),
+            
+        })
+    }
+
     fn close(&mut self) -> PyResult<()> {
         if let Some(arc) = self.engine.take() {
             match Arc::try_unwrap(arc) {
@@ -589,5 +803,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Workspace>()?;
     m.add_class::<ContextEngine>()?;
     m.add_class::<Document>()?;
+    m.add_class::<Agent>()?;
     Ok(())
 }

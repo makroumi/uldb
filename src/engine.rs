@@ -98,7 +98,7 @@ pub struct Engine {
     compactor: BackgroundCompactor,
     pub indices: IndexManager,
     pub state: Hamt,
-    snapshots: HashMap<String, Hamt>,
+    pub snapshots: HashMap<String, Hamt>,
     snapshot_counter: u64,
     flush_count: u64,
     total_puts: AtomicU64,
