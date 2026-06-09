@@ -143,7 +143,88 @@ impl ContextEngine {
             .map_err(|e| PyRuntimeError::new_err(format!("ingest failed: {e}")))
     }
 
-    fn __repr__(&self) -> String {
+    /// Vector similarity search using HNSW.
+    #[pyo3(signature = (embedding, limit=10))]
+    fn search_vector(&self, embedding: Vec<f32>, limit: usize) -> PyResult<Vec<Document>> {
+        let eng = self.engine.read()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        if let Some(ref hnsw) = eng.indices.hnsw {
+            let results = hnsw.search(&embedding, limit);
+            Ok(results.into_iter().map(|r| {
+                let value = eng.get(&r.key).unwrap_or_default();
+                Document {
+                    id: String::from_utf8_lossy(&r.key).to_string(),
+                    content_bytes: value,
+                    meta: HashMap::new(),
+                    score: 1.0 - r.distance as f64,
+                }
+            }).collect())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Add a relation edge between two symbols.
+    fn add_edge(&self, src: &str, dst: &str, relation: &str) -> PyResult<()> {
+        let mut eng = self.engine.write()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        eng.indices.on_add_edge(src, dst, relation);
+        Ok(())
+    }
+
+    /// Traverse the relation graph from a start node.
+    #[pyo3(signature = (start, relation="calls", depth=3, limit=20))]
+    fn search_graph(&self, start: &str, relation: &str, depth: usize, limit: usize) -> PyResult<Vec<Document>> {
+        let mut eng = self.engine.write()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        let spec = QuerySpec {
+            text: start.to_string(),
+            relations: vec![relation.to_string()],
+            top_k: limit,
+            max_depth: depth,
+            ..Default::default()
+        };
+        let hits = eng.indices.query(&spec);
+        Ok(hits.into_iter().map(|h| {
+            let value = eng.get(&h.key).unwrap_or_default();
+            Document {
+                id: String::from_utf8_lossy(&h.key).to_string(),
+                content_bytes: value,
+                meta: HashMap::new(),
+                score: h.score,
+            }
+        }).collect())
+    }
+
+    /// Index a document with optional vector and edges.
+    /// Unified entry point for full document indexing.
+    #[pyo3(signature = (key, content, vector=None, edges=None))]
+    fn index(
+        &self,
+        key: &str,
+        content: &[u8],
+        vector: Option<Vec<f32>>,
+        edges: Option<Vec<(String, String)>>,
+    ) -> PyResult<()> {
+        let mut eng = self.engine.write()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        // Write the record
+        eng.put(key.as_bytes(), content)
+            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+        // Add vector embedding if provided
+        if let Some(vec) = vector {
+            eng.indices.on_put_vector(key.as_bytes(), vec);
+        }
+        // Add graph edges if provided
+        if let Some(edge_list) = edges {
+            for (dst, rel) in edge_list {
+                eng.indices.on_add_edge(key, &dst, &rel);
+            }
+        }
+        Ok(())
+    }
+
+        fn __repr__(&self) -> String {
         let eng = self.engine.read().unwrap();
         let stats = eng.indices.stats();
         format!(
@@ -345,8 +426,7 @@ impl Client {
             is_branch: true,
         })
     }
-
-    /// Create an isolated agent workspace.
+        /// Create an isolated agent workspace.
     fn agent(&self, name: &str) -> PyResult<Agent> {
         let eng = self.get_engine()?;
         let mut e = eng.write()
@@ -638,7 +718,62 @@ impl Agent {
         Ok(false)
     }
 
-    fn __repr__(&self) -> String {
+    /// Vector similarity search (shared index).
+    #[pyo3(signature = (embedding, limit=10))]
+    fn search_vector(&self, embedding: Vec<f32>, limit: usize) -> PyResult<Vec<Document>> {
+        let eng = self.engine.read()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        if let Some(ref hnsw) = eng.indices.hnsw {
+            Ok(hnsw.search(&embedding, limit).into_iter().map(|r| {
+                let value = eng.get(&r.key).unwrap_or_default();
+                Document {
+                    id: String::from_utf8_lossy(&r.key).to_string(),
+                    content_bytes: value,
+                    meta: HashMap::new(),
+                    score: 1.0 - r.distance as f64,
+                }
+            }).collect())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Graph traversal (shared index).
+    #[pyo3(signature = (start, relation="calls", depth=3, limit=20))]
+    fn search_graph(&self, start: &str, relation: &str, depth: usize, limit: usize) -> PyResult<Vec<Document>> {
+        let mut eng = self.engine.write()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        let spec = QuerySpec {
+            text: start.to_string(),
+            relations: vec![relation.to_string()],
+            top_k: limit,
+            max_depth: depth,
+            ..Default::default()
+        };
+        let hits = eng.indices.query(&spec);
+        Ok(hits.into_iter().map(|h| {
+            let value = eng.get(&h.key).unwrap_or_default();
+            Document {
+                id: String::from_utf8_lossy(&h.key).to_string(),
+                content_bytes: value,
+                meta: HashMap::new(),
+                score: h.score,
+            }
+        }).collect())
+    }
+
+    /// Create a checkpoint within this agent's work.
+    #[pyo3(signature = (name=None))]
+    fn checkpoint(&self, name: Option<&str>) -> PyResult<String> {
+        let mut eng = self.engine.write()
+            .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
+        let snap_name = name.map(|n| n.to_string()).unwrap_or_else(||
+            format!("{}-checkpoint", self.name)
+        );
+        Ok(eng.snapshot_create(&snap_name))
+    }
+
+        fn __repr__(&self) -> String {
         format!("Agent({:?})", self.name)
     }
 }
@@ -761,6 +896,112 @@ impl DB {
     ///         docs = agent.search("validate")
     ///         agent.put("key", b"new value")
     ///         # auto-merge on success, auto-rollback on failure
+    /// Full-text + fuzzy search (typo-tolerant symbol lookup).
+    #[pyo3(signature = (symbol, limit=5))]
+    fn search_fuzzy(&self, symbol: &str, limit: usize) -> PyResult<Vec<Document>> {
+        let eng = self.eng()?;
+        let eng = eng.read().map_err(|_| PyRuntimeError::new_err("lock"))?;
+        let results = eng.indices.fuzzy.query(symbol, limit);
+        Ok(results.into_iter().map(|m| {
+            let value = eng.get(m.symbol.as_bytes()).unwrap_or_default();
+            Document { id: m.symbol, content_bytes: value, meta: HashMap::new(), score: m.jaccard }
+        }).collect())
+    }
+
+    /// Vector similarity search using HNSW index.
+    #[pyo3(signature = (embedding, limit=10))]
+    fn search_vector(&self, embedding: Vec<f32>, limit: usize) -> PyResult<Vec<Document>> {
+        let eng = self.eng()?;
+        let eng = eng.read().map_err(|_| PyRuntimeError::new_err("lock"))?;
+        if let Some(ref hnsw) = eng.indices.hnsw {
+            let results = hnsw.search(&embedding, limit);
+            Ok(results.into_iter().map(|r| {
+                let value = eng.get(&r.key).unwrap_or_default();
+                Document {
+                    id: String::from_utf8_lossy(&r.key).to_string(),
+                    content_bytes: value, meta: HashMap::new(),
+                    score: 1.0 - r.distance as f64,
+                }
+            }).collect())
+        } else { Ok(Vec::new()) }
+    }
+
+    /// Add a relation edge between two symbols.
+    fn add_edge(&self, src: &str, dst: &str, relation: &str) -> PyResult<()> {
+        let eng = self.eng()?;
+        let mut eng = eng.write().map_err(|_| PyRuntimeError::new_err("lock"))?;
+        eng.indices.on_add_edge(src, dst, relation);
+        Ok(())
+    }
+
+    /// Graph traversal search from a start node.
+    #[pyo3(signature = (start, relation="calls", depth=3, limit=20))]
+    fn search_graph(&self, start: &str, relation: &str, depth: usize, limit: usize) -> PyResult<Vec<Document>> {
+        let eng = self.eng()?;
+        let mut eng = eng.write().map_err(|_| PyRuntimeError::new_err("lock"))?;
+        let spec = QuerySpec {
+            text: start.to_string(), relations: vec![relation.to_string()],
+            top_k: limit, max_depth: depth, ..Default::default()
+        };
+        let hits = eng.indices.query(&spec);
+        Ok(hits.into_iter().map(|h| {
+            let value = eng.get(&h.key).unwrap_or_default();
+            Document {
+                id: String::from_utf8_lossy(&h.key).to_string(),
+                content_bytes: value, meta: HashMap::new(), score: h.score,
+            }
+        }).collect())
+    }
+
+    /// Unified indexing: write content + optional vector + optional graph edges.
+    #[pyo3(signature = (key, content, vector=None, edges=None))]
+    fn index(&self, key: &str, content: &[u8], vector: Option<Vec<f32>>, edges: Option<Vec<(String, String)>>) -> PyResult<()> {
+        let eng = self.eng()?;
+        let mut eng = eng.write().map_err(|_| PyRuntimeError::new_err("lock"))?;
+        eng.put(key.as_bytes(), content).map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+        if let Some(vec) = vector { eng.indices.on_put_vector(key.as_bytes(), vec); }
+        if let Some(el) = edges { for (dst, rel) in el { eng.indices.on_add_edge(key, &dst, &rel); } }
+        Ok(())
+    }
+
+    /// Delete all keys in range [start, end).
+    fn delete_range(&self, start: &str, end: &str) -> PyResult<usize> {
+        let eng = self.eng()?;
+        let mut eng = eng.write().map_err(|_| PyRuntimeError::new_err("lock"))?;
+        let keys: Vec<Vec<u8>> = eng.scan(start.as_bytes(), end.as_bytes())
+            .into_iter().map(|(k, _)| k).collect();
+        let count = keys.len();
+        for key in keys { eng.delete(&key).map_err(|e| PyRuntimeError::new_err(format!("{e}")))?; }
+        Ok(count)
+    }
+
+    /// List keys with optional prefix filter.
+    #[pyo3(signature = (prefix="", limit=10000))]
+    fn keys(&self, prefix: &str, limit: usize) -> PyResult<Vec<String>> {
+        let eng = self.eng()?;
+        let eng = eng.read().map_err(|_| PyRuntimeError::new_err("lock"))?;
+        let start = prefix.as_bytes();
+        let mut end = start.to_vec(); end.push(0xFF);
+        Ok(eng.scan(start, &end).into_iter().take(limit)
+            .map(|(k, _)| String::from_utf8_lossy(&k).to_string()).collect())
+    }
+
+    /// Database statistics.
+    fn stats(&self) -> PyResult<HashMap<String, usize>> {
+        let eng = self.eng()?;
+        let eng = eng.read().map_err(|_| PyRuntimeError::new_err("lock"))?;
+        let idx = eng.indices.stats();
+        let mut s = HashMap::new();
+        s.insert("records".into(), eng.memtable_len());
+        s.insert("flush_count".into(), eng.flush_count() as usize);
+        s.insert("index_docs".into(), idx.bm25_docs);
+        s.insert("index_symbols".into(), idx.fuzzy_symbols);
+        s.insert("index_vectors".into(), idx.hnsw_vectors);
+        s.insert("graph_nodes".into(), idx.graph_nodes);
+        s.insert("graph_edges".into(), idx.graph_edges);
+        Ok(s)
+    }
+
     fn agent(&self, name: &str) -> PyResult<Agent> {
         let eng = self.eng()?;
         let mut e = eng.write().map_err(|_| PyRuntimeError::new_err("lock"))?;
