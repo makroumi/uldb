@@ -357,7 +357,7 @@ impl Client {
         Ok(Agent {
             engine: eng.clone(),
             name: name.to_string(),
-            
+            finished: false,
         })
     }
 
@@ -452,10 +452,25 @@ impl Client {
 ///         agent.put("auth.py::validate", b"def validate_v2(): ...")
 ///         # auto-merge on clean exit
 ///         # auto-rollback on exception
+/// An isolated agent workspace for agentic AI workflows.
+///
+/// Consistency guarantees:
+///   - Agent reads see: snapshot state at creation + agent's own writes
+///   - Agent writes are invisible to main and other agents until commit
+///   - Search (agent.search) always reflects committed main state
+///   - Merge applies all agent writes to main atomically
+///   - Rollback discards all agent writes completely
+///
+/// Lifecycle: created -> active -> committed/rolled_back
+///   - Context manager: auto-merge on clean exit, auto-rollback on exception
+///   - After commit or rollback, the agent cannot be used again
+///
+/// Agents cannot fork other agents. Each agent is independent.
 #[pyclass]
 struct Agent {
     engine: Arc<RwLock<Engine>>,
     name: String,
+    finished: bool,
 }
 
 #[pymethods]
@@ -526,6 +541,7 @@ impl Agent {
 
     /// Write a document in isolation. Only visible to this agent until commit.
     fn put(&self, path: &str, content: &[u8]) -> PyResult<()> {
+        if self.finished { return Err(PyRuntimeError::new_err("agent is already committed or rolled back")); }
         let mut eng = self.engine.write()
             .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
         let branch = eng.snapshots.get(&self.name)
@@ -568,6 +584,7 @@ impl Agent {
 
     /// Bulk write documents in isolation.
     fn load(&self, records: HashMap<String, Vec<u8>>) -> PyResult<usize> {
+        if self.finished { return Err(PyRuntimeError::new_err("agent is already committed or rolled back")); }
         let mut eng = self.engine.write()
             .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
         let mut branch = eng.snapshots.get(&self.name)
@@ -583,18 +600,23 @@ impl Agent {
     }
 
     /// Manually commit (merge) this agent's work to main.
-    fn commit(&self) -> PyResult<usize> {
+    fn commit(&mut self) -> PyResult<usize> {
+        if self.finished { return Err(PyRuntimeError::new_err("agent already finished")); }
         let mut eng = self.engine.write()
             .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
-        eng.branch_merge(&self.name)
-            .map_err(|e| PyRuntimeError::new_err(e))
+        let result = eng.branch_merge(&self.name)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+        self.finished = true;
+        Ok(result)
     }
 
     /// Manually discard all agent's work.
-    fn discard(&self) -> PyResult<()> {
+    fn discard(&mut self) -> PyResult<()> {
+        if self.finished { return Ok(()); }
         let mut eng = self.engine.write()
             .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
         eng.branch_rollback(&self.name);
+        self.finished = true;
         Ok(())
     }
 
@@ -603,7 +625,8 @@ impl Agent {
         slf
     }
 
-    fn __exit__(&self, exc_type: Option<&Bound<PyAny>>, _ev: Option<&Bound<PyAny>>, _tb: Option<&Bound<PyAny>>) -> PyResult<bool> {
+    fn __exit__(&mut self, exc_type: Option<&Bound<PyAny>>, _ev: Option<&Bound<PyAny>>, _tb: Option<&Bound<PyAny>>) -> PyResult<bool> {
+        if self.finished { return Ok(false); }
         let mut eng = self.engine.write()
             .map_err(|_| PyRuntimeError::new_err("lock poisoned"))?;
         if exc_type.is_some() {
@@ -611,6 +634,7 @@ impl Agent {
         } else {
             let _ = eng.branch_merge(&self.name);
         }
+        self.finished = true;
         Ok(false)
     }
 
@@ -620,6 +644,13 @@ impl Agent {
 }
 
 /// The simplest way to use uldb. One class does everything.
+///
+/// Consistency guarantees:
+///   - put() is immediately visible to get() and search()
+///   - search() is deterministic: same query + same data = same results
+///   - agent writes are isolated until commit (auto on clean context exit)
+///   - snapshots are O(1) and share memory via structural sharing
+///   - all data is crash-safe via write-ahead log
 ///
 ///     db = DB("./my_data")
 ///     db.put("key", b"value")
@@ -739,7 +770,7 @@ impl DB {
         Ok(Agent {
             engine: eng.clone(),
             name: name.to_string(),
-            
+            finished: false,
         })
     }
 
