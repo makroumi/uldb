@@ -16,6 +16,8 @@ use std::thread;
 
 use uldb::agent_store;
 use uldb::engine::{Engine, EngineConfig};
+use uldb::namespace::scope_key;
+use ulmp::messages::admin;
 use uldb::query::planner::QuerySpec;
 use uldb::server::UmpHandler;
 use ulmp::messages::{record, query, tx, snapshot, branch};
@@ -1202,5 +1204,295 @@ fn stub_vector_query_requires_vector_submission() {
     let rows = count_result_rows(&resp);
     assert_eq!(rows, 0, "vector query without embedding submission must return 0 rows");
     // When fixed: add OP_PUT_VECTOR or embedding field, assert rows > 0
+    cleanup(&dir);
+}
+
+// ===========================================================================
+// 16. WATCH REGISTRY
+// ===========================================================================
+
+#[test]
+fn watch_register_and_unwatch() {
+    let dir = tmp_dir("watch_reg");
+    fs::create_dir_all(&dir).unwrap();
+    let handler = make_handler(&dir);
+
+    // Register a watch
+    let resp = handler.handle_watch(ulmp::messages::watch::Watch {
+        namespace_id: 0,
+        scope: 0x01,
+        pattern: "auth.".into(),
+        watch_id: 42,
+        initial_credit: 100,
+    });
+    match resp {
+        Response::Single { opcode: op, .. } if op == opcode::OP_RESULT_END => {}
+        other => panic!("watch must succeed, got: {:?}", other),
+    }
+
+    // Unwatch
+    let resp2 = handler.handle_unwatch(ulmp::messages::watch::Unwatch {
+        watch_id: 42,
+    });
+    match resp2 {
+        Response::Single { opcode: op, .. } if op == opcode::OP_RESULT_END => {}
+        other => panic!("unwatch must succeed, got: {:?}", other),
+    }
+
+    // Unwatch again should fail
+    let resp3 = handler.handle_unwatch(ulmp::messages::watch::Unwatch {
+        watch_id: 42,
+    });
+    match resp3 {
+        Response::Single { opcode: op, .. } if op == opcode::OP_ERROR => {}
+        other => panic!("double unwatch must error, got: {:?}", other),
+    }
+
+    cleanup(&dir);
+}
+
+#[test]
+fn watch_window_adds_credit() {
+    let dir = tmp_dir("watch_credit");
+    fs::create_dir_all(&dir).unwrap();
+    let handler = make_handler(&dir);
+
+    handler.handle_watch(ulmp::messages::watch::Watch {
+        namespace_id: 0,
+        scope: 0x01,
+        pattern: "test.".into(),
+        watch_id: 99,
+        initial_credit: 10,
+    });
+
+    // Add credits
+    let resp = handler.handle_watch_window(ulmp::messages::watch::WatchWindow {
+        watch_id: 99,
+        credit: 50,
+    });
+    match resp {
+        Response::None => {} // acknowledged
+        other => panic!("watch_window must return None, got: {:?}", other),
+    }
+
+    // Invalid watch_id
+    let resp2 = handler.handle_watch_window(ulmp::messages::watch::WatchWindow {
+        watch_id: 999,
+        credit: 10,
+    });
+    match resp2 {
+        Response::Single { opcode: op, .. } if op == opcode::OP_ERROR => {}
+        other => panic!("watch_window on unknown id must error, got: {:?}", other),
+    }
+
+    cleanup(&dir);
+}
+
+// ===========================================================================
+// 17. AUTH ROTATION
+// ===========================================================================
+
+#[test]
+fn auth_rotate_returns_challenge() {
+    let dir = tmp_dir("auth_rotate");
+    fs::create_dir_all(&dir).unwrap();
+    let handler = make_handler(&dir);
+
+    let resp = handler.handle_auth_rotate_request(
+        ulmp::messages::auth_rotate::AuthRotateRequest,
+    );
+    match resp {
+        Response::Single { opcode: op, payload } => {
+            assert_eq!(op, ulmp::messages::opcode::OP_AUTH_ROTATE_CHALLENGE,
+                "must return AUTH_ROTATE_CHALLENGE opcode");
+            assert!(!payload.is_empty(), "challenge payload must not be empty");
+        }
+        other => panic!("auth_rotate_request must return challenge, got: {:?}", other),
+    }
+
+    cleanup(&dir);
+}
+
+#[test]
+fn auth_rotate_accepts() {
+    let dir = tmp_dir("auth_accept");
+    fs::create_dir_all(&dir).unwrap();
+    let handler = make_handler(&dir);
+
+    let resp = handler.handle_auth_rotate(
+        ulmp::messages::auth_rotate::AuthRotate {
+            new_token_hash: [0u8; 32],
+        },
+    );
+    match resp {
+        Response::Single { opcode: op, .. } => {
+            assert_eq!(op, ulmp::messages::opcode::OP_AUTH_ROTATE_ACK,
+                "must return AUTH_ROTATE_ACK opcode");
+        }
+        other => panic!("auth_rotate must return ack, got: {:?}", other),
+    }
+
+    cleanup(&dir);
+}
+
+// ===========================================================================
+// 18. STREAM RESUME
+// ===========================================================================
+
+#[test]
+fn stream_resume_with_valid_token() {
+    let dir = tmp_dir("stream_resume");
+    fs::create_dir_all(&dir).unwrap();
+    let handler = make_handler(&dir);
+
+    // Build a 64-byte token with confirmed_row=42 at bytes 32..36
+    let mut token = vec![0u8; 64];
+    token[32..36].copy_from_slice(&42u32.to_be_bytes());
+
+    let resp = handler.handle_stream_resume(
+        ulmp::messages::checkpoint::StreamResume { token },
+    );
+    match resp {
+        Response::Single { opcode: op, .. } if op == opcode::OP_RESULT_END => {}
+        other => panic!("stream_resume with valid token must succeed, got: {:?}", other),
+    }
+
+    cleanup(&dir);
+}
+
+#[test]
+fn stream_resume_invalid_token_length() {
+    let dir = tmp_dir("stream_resume_bad");
+    fs::create_dir_all(&dir).unwrap();
+    let handler = make_handler(&dir);
+
+    let resp = handler.handle_stream_resume(
+        ulmp::messages::checkpoint::StreamResume { token: vec![0u8; 10] },
+    );
+    match resp {
+        Response::Single { opcode: op, .. } if op == opcode::OP_ERROR => {}
+        other => panic!("stream_resume with bad token must error, got: {:?}", other),
+    }
+
+    cleanup(&dir);
+}
+
+// ===========================================================================
+// 19. BACKUP
+// ===========================================================================
+
+#[test]
+fn backup_creates_copy() {
+    let dir = tmp_dir("backup_test");
+    fs::create_dir_all(&dir).unwrap();
+    let handler = make_handler(&dir);
+
+    // Write some data
+    for i in 0..10u32 {
+        handler.handle_put(record::Put {
+            key: format!("backup_key_{i}"),
+            value: format!("backup_val_{i}").into_bytes(),
+        });
+    }
+
+    let backup_dir = tmp_dir("backup_dest");
+    let resp = handler.handle_backup(admin::Backup {
+        destination: backup_dir.to_string_lossy().to_string(),
+    });
+    match resp {
+        Response::Single { opcode: op, .. } if op == opcode::OP_RESULT_END => {}
+        other => panic!("backup must succeed, got: {:?}", other),
+    }
+
+    // Verify backup directory has files
+    assert!(backup_dir.exists(), "backup directory must exist");
+    let file_count: usize = fs::read_dir(&backup_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .count();
+    assert!(file_count > 0, "backup directory must have files");
+
+    // Verify backup is usable: open as a new engine
+    let eng2 = Engine::open(EngineConfig::new(&backup_dir)).unwrap();
+    for i in 0..10u32 {
+        let key = format!("backup_key_{i}");
+        let expected = format!("backup_val_{i}");
+        let scoped = scope_key(0, key.as_bytes());
+        let val = eng2.get(&scoped);
+        assert!(
+            val.is_some(),
+            "backup must contain key {key}"
+        );
+        assert_eq!(
+            val.unwrap(), expected.as_bytes(),
+            "backup must contain correct value for {key}"
+        );
+    }
+
+    cleanup(&dir);
+    cleanup(&backup_dir);
+}
+
+#[test]
+fn restore_returns_proper_error() {
+    let dir = tmp_dir("restore_test");
+    fs::create_dir_all(&dir).unwrap();
+    let handler = make_handler(&dir);
+
+    let resp = handler.handle_restore_backup(admin::RestoreBackup {
+        source: "/tmp/nonexistent".into(),
+        data: vec![],
+    });
+    match resp {
+        Response::Single { opcode: op, .. } if op == opcode::OP_ERROR => {}
+        other => panic!("restore must return error (requires restart), got: {:?}", other),
+    }
+
+    cleanup(&dir);
+}
+
+// ===========================================================================
+// 20. CONFIG
+// ===========================================================================
+
+#[test]
+fn config_set_is_readonly() {
+    let dir = tmp_dir("config_set");
+    fs::create_dir_all(&dir).unwrap();
+    let handler = make_handler(&dir);
+
+    let resp = handler.handle_config_set(admin::ConfigSet {
+        key: "max_connections".into(),
+        value: "2048".into(),
+    });
+    match resp {
+        Response::Single { opcode: op, .. } if op == opcode::OP_ERROR => {}
+        other => panic!("config_set must return error (read-only), got: {:?}", other),
+    }
+
+    cleanup(&dir);
+}
+
+#[test]
+fn config_get_known_keys() {
+    let dir = tmp_dir("config_get");
+    fs::create_dir_all(&dir).unwrap();
+    let handler = make_handler(&dir);
+
+    for key in &["version", "max_connections", "flush_threshold"] {
+        let resp = handler.handle_config_get(admin::ConfigGet { key: key.to_string() });
+        match resp {
+            Response::Single { opcode: op, .. } if op == opcode::OP_RESULT_END => {}
+            other => panic!("config_get({key}) must succeed, got: {:?}", other),
+        }
+    }
+
+    // Unknown key
+    let resp = handler.handle_config_get(admin::ConfigGet { key: "nonexistent".into() });
+    match resp {
+        Response::Single { opcode: op, .. } if op == opcode::OP_ERROR => {}
+        other => panic!("config_get(unknown) must error, got: {:?}", other),
+    }
+
     cleanup(&dir);
 }

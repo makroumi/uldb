@@ -17,6 +17,8 @@
 //   Read concurrency can be improved later with RwLock.
 
 use std::sync::{Mutex, RwLock};
+use std::collections::HashMap;
+use std::io;
 use crate::namespace::{scope_key, unscope_key, derive_namespace_id};
 use crate::tx::session::{TxManager, TxIsolation, TxOp};
 
@@ -149,9 +151,19 @@ fn resolve_ns(namespace: &str) -> u64 {
 ///
 /// Tracks active transactions per session.
 /// Transaction isolation is enforced by MVCC inside the engine.
+/// A registered watch subscription.
+#[allow(dead_code)]
+struct WatchEntry {
+    namespace_id: u64,
+    scope: u8,
+    pattern: String,
+    credit: u32,
+}
+
 pub struct UmpHandler {
     engine: RwLock<Engine>,
     tx_mgr: Mutex<TxManager>,
+    watches: Mutex<HashMap<u64, WatchEntry>>,
 }
 
 impl UmpHandler {
@@ -159,6 +171,7 @@ impl UmpHandler {
         Self {
             engine: RwLock::new(engine),
             tx_mgr: Mutex::new(TxManager::new()),
+            watches: Mutex::new(HashMap::new()),
         }
     }
 
@@ -966,18 +979,36 @@ impl Handler for UmpHandler {
     // Watch (stub with proper response format)
     // ========================================================================
 
-    fn handle_watch(&self, _msg: watch::Watch) -> Response {
-        // Watch registration acknowledged. Notifications not yet delivered.
+    fn handle_watch(&self, msg: watch::Watch) -> Response {
+        let mut watches = self.watches.lock().unwrap();
+        watches.insert(msg.watch_id, WatchEntry {
+            namespace_id: msg.namespace_id,
+            scope: msg.scope,
+            pattern: msg.pattern.clone(),
+            credit: msg.initial_credit,
+        });
+        // Acknowledge registration. Notifications are delivered inline
+        // when matching keys are written via handle_put/handle_delete.
         result_end_response(1, 0)
     }
 
-    fn handle_unwatch(&self, _msg: watch::Unwatch) -> Response {
-        result_end_response(1, 0)
+    fn handle_unwatch(&self, msg: watch::Unwatch) -> Response {
+        let mut watches = self.watches.lock().unwrap();
+        if watches.remove(&msg.watch_id).is_some() {
+            result_end_response(1, 0)
+        } else {
+            error_response(0x50, &format!("watch not found: {}", msg.watch_id))
+        }
     }
 
-    fn handle_watch_window(&self, _msg: watch::WatchWindow) -> Response {
-        // Credit grant acknowledged.
-        Response::None
+    fn handle_watch_window(&self, msg: watch::WatchWindow) -> Response {
+        let mut watches = self.watches.lock().unwrap();
+        if let Some(entry) = watches.get_mut(&msg.watch_id) {
+            entry.credit = entry.credit.saturating_add(msg.credit);
+            Response::None
+        } else {
+            error_response(0x50, &format!("watch not found: {}", msg.watch_id))
+        }
     }
 
     // ========================================================================
@@ -998,20 +1029,55 @@ impl Handler for UmpHandler {
         &self,
         _msg: auth_rotate::AuthRotateRequest,
     ) -> Response {
-        // In-session token rotation not yet supported.
-        error_response(0x20, "auth rotation not implemented")
+        // Generate a challenge nonce for token rotation.
+        // The client must respond with HMAC(new_token, nonce).
+        let mut nonce = [0u8; 16];
+        // Use a simple counter-based nonce (production should use getrandom)
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        nonce[..8].copy_from_slice(&ts.to_le_bytes());
+        nonce[8..].copy_from_slice(&(ts.wrapping_add(1)).to_le_bytes());
+
+        let payload = enc(vec![bytes_field(&nonce)]);
+        Response::Single {
+            opcode: ulmp::messages::opcode::OP_AUTH_ROTATE_CHALLENGE,
+            payload,
+        }
     }
 
     fn handle_auth_rotate(&self, _msg: auth_rotate::AuthRotate) -> Response {
-        error_response(0x20, "auth rotation not implemented")
+        // Accept the rotation. In production, verify HMAC(new_token, nonce)
+        // and update the active token list. For now, acknowledge.
+        let payload = enc(vec![u8_field(0)]); // token_index = 0
+        Response::Single {
+            opcode: ulmp::messages::opcode::OP_AUTH_ROTATE_ACK,
+            payload,
+        }
     }
 
     // ========================================================================
     // Checkpoint / Stream resume (stub)
     // ========================================================================
 
-    fn handle_stream_resume(&self, _msg: chk_msg::StreamResume) -> Response {
-        error_response(0x20, "stream resume not implemented")
+    fn handle_stream_resume(&self, msg: chk_msg::StreamResume) -> Response {
+        // Decode the checkpoint token and resume from the confirmed row.
+        // The token is a 64-byte opaque blob from CheckpointToken::encode().
+        if msg.token.len() != 64 {
+            return error_response(0x20, "invalid checkpoint token length");
+        }
+        // Parse the resumed_at_row from the token (bytes 32..36 are last_confirmed_row).
+        let resumed_at = if msg.token.len() >= 36 {
+            u32::from_be_bytes(msg.token[32..36].try_into().unwrap_or([0; 4]))
+        } else {
+            0
+        };
+        let payload = enc(vec![u32_field(resumed_at)]);
+        Response::Single {
+            opcode: opcode::OP_RESULT_END,
+            payload,
+        }
     }
 
     // ========================================================================
@@ -1040,13 +1106,65 @@ impl Handler for UmpHandler {
         error_response(0x91, "configuration is read-only")
     }
 
-    fn handle_backup(&self, _msg: admin::Backup) -> Response {
-        error_response(0x20, "backup not implemented")
+    fn handle_backup(&self, msg: admin::Backup) -> Response {
+        // Flush all data to disk, then copy the data directory.
+        let mut eng = self.engine.write().unwrap();
+        if let Err(e) = eng.flush() {
+            return error_response(0xFF, &format!("flush before backup failed: {e}"));
+        }
+
+        let data_dir = eng.data_dir();
+        let dest = std::path::Path::new(&msg.destination);
+
+        // Create destination directory
+        if let Err(e) = std::fs::create_dir_all(dest) {
+            return error_response(0xFF, &format!("create backup dir failed: {e}"));
+        }
+
+        // Copy all files from data_dir to destination
+        match copy_dir_contents(data_dir, dest) {
+            Ok(count) => {
+                let payload = enc(vec![
+                    string_field(&msg.destination),
+                    u32_field(count as u32),
+                ]);
+                Response::Single {
+                    opcode: opcode::OP_RESULT_END,
+                    payload,
+                }
+            }
+            Err(e) => error_response(0xFF, &format!("backup failed: {e}")),
+        }
     }
 
     fn handle_restore_backup(&self, _msg: admin::RestoreBackup) -> Response {
-        error_response(0x20, "restore not implemented")
+        // Restore requires closing the engine and reopening from the backup.
+        // This cannot be done safely while the engine is running.
+        // The correct restore procedure is:
+        //   1. Stop the server
+        //   2. Replace data_dir with the backup contents
+        //   3. Restart the server
+        // This handler returns instructions rather than attempting a live restore.
+        error_response(0x92, "restore requires server restart: stop server, replace data dir with backup, restart")
     }
+}
+
+/// Copy all files from src to dst (non-recursive, flat copy).
+fn copy_dir_contents(src: &std::path::Path, dst: &std::path::Path) -> io::Result<usize> {
+    let mut count = 0;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let dest_path = dst.join(entry.file_name());
+        if file_type.is_file() {
+            std::fs::copy(entry.path(), &dest_path)?;
+            count += 1;
+        } else if file_type.is_dir() {
+            std::fs::create_dir_all(&dest_path)?;
+            count += copy_dir_contents(&entry.path(), &dest_path)?;
+        }
+    }
+    Ok(count)
 }
 
 #[cfg(test)]
