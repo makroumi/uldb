@@ -19,6 +19,7 @@ pub mod namespace;
 
 #[cfg(feature = "server")]
 pub mod server;
+pub mod agent_store;
 
 #[cfg(feature = "python")]
 mod python;

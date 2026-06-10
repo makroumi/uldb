@@ -20,6 +20,7 @@ crc32fast = "1.4"
 flate2 = "1.0"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 ulmp = { path = "../ulmp", optional = true }
+ulmen-core = { path = "../lumen/ulmen-core" }
 pyo3 = { version = "0.25", features = ["extension-module"], optional = true }
 
 [features]
@@ -29,6 +30,7 @@ python = ["pyo3"]
 
 [dev-dependencies]
 rand = "0.8"
+tempfile = "3"
 
 [profile.release]
 lto = true
