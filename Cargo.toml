@@ -52,3 +52,8 @@ required-features = ["server"]
 name = "engine_bench"
 path = "benches/engine_bench.rs"
 harness = false
+
+[[test]]
+name = "correctness"
+path = "tests/rust/correctness.rs"
+required-features = ["server"]
