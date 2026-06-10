@@ -773,7 +773,10 @@ impl Engine {
 
         for (key, value) in entries {
             self.state = self.state.put(key.to_vec(), value.to_vec());
-            // Also update the memtable so GET sees the merged data.
+            // Write to WAL for crash safety (branch_merge must be durable).
+            self.wal.append(key, value)
+                .map_err(|e| format!("WAL write failed during merge: {e}"))?;
+            // Update memtable so GET sees the merged data.
             self.memtable.put(key.to_vec(), value.to_vec());
             self.indices.on_put(key, value);
         }
